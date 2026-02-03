@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Test Ext",
+  "description": "This a test ext",
+  "version": "1.0",
+  "incognito": "spanning",
+  "action": {
+    "default_popup": "src/popup/popup.html"
+  },
+  "icons": {
+    "16": "images/icon-16.png",
+    "32": "images/icon-32.png",
+    "128": "images/icon-128.png"
+  },
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "permissions": ["contextMenus", "activeTab", "scripting", "tabs", "storage"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://mp.speechmatics.com/*",
+    "wss://eu.rt.speechmatics.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": [
+        "src/content/services/event-emitter.js",
+        "src/content/services/notification-system.js",
+        "src/content/services/api-client.js",
+        "src/content/services/state-manager.js",
+        "src/content/services/dom-utils.js",
+        "src/content/services/settings-manager.js",
+        "src/content/handlers/transcription-handler.js",
+        "src/content/handlers/chatgpt.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/content/worklets/pcm16-downsampler.js"],
+      "matches": ["https://chatgpt.com/*"]
+    }
+  ]
+}

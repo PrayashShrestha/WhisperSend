@@ -1,0 +1,1821 @@
+Speechmatics Documentation:
+# Quickstart
+
+Learn how to convert streaming audio to text.
+
+The easiest way to try Realtime transcription is via the [web portal](https://portal.speechmatics.com/jobs/create/real-time).
+
+## Using the Realtime SaaS webSocket API[​](#using-the-realtime-saas-websocket-api "Direct link to Using the Realtime SaaS webSocket API")
+
+### 1. Create an API key[​](#1-create-an-api-key "Direct link to 1. Create an API key")
+
+[Create an API key in the portal here](https://portal.speechmatics.com/settings/api-keys), which you'll use to securely access the API. Store the key as a managed secret.
+
+Enterprise customers may need to speak to [Support](https://support.speechmatics.com) to get your API keys.
+
+### 2. Pick and install a library[​](#2-pick-and-install-a-library "Direct link to 2. Pick and install a library")
+
+Check out our [JavaScript client](https://www.npmjs.com/package/@speechmatics/real-time-client) or [Python client](https://pypi.org/project/speechmatics-python/) to get started.
+
+JavaScriptJavaScriptPythonPython
+
+```
+npm install @speechmatics/real-time-client @speechmatics/auth
+```
+
+```
+pip3 install speechmatics-python
+```
+
+### 3. Insert your API key[​](#3-insert-your-api-key "Direct link to 3. Insert your API key")
+
+Paste your API key into `YOUR_API_KEY` in the code.
+
+JavaScriptJavaScriptPythonPython
+
+```
+import https from "node:https";
+import { createSpeechmaticsJWT } from "@speechmatics/auth";
+import { RealtimeClient } from "@speechmatics/real-time-client";
+
+const apiKey = YOUR_API_KEY;
+const client = new RealtimeClient();
+const streamURL = "https://media-ice.musicradio.com/LBCUKMP3";
+
+async function transcribe() {
+  // Print transcript as we receive it
+  client.addEventListener("receiveMessage", ({ data }) => {
+    if (data.message === "AddTranscript") {
+      for (const result of data.results) {
+        if (result.type === "word") {
+          process.stdout.write(" ");
+        }
+        process.stdout.write(`${result.alternatives?.[0].content}`);
+        if (result.is_eos) {
+          process.stdout.write("\n");
+        }
+      }
+    } else if (data.message === "EndOfTranscript") {
+      process.stdout.write("\n");
+      process.exit(0);
+    } else if (data.message === "Error") {
+      process.stdout.write(`\n${JSON.stringify(data)}\n`);
+      process.exit(1);
+    }
+  });
+
+  const jwt = await createSpeechmaticsJWT({
+    type: "rt",
+    apiKey,
+    ttl: 60, // 1 minute
+  });
+
+  await client.start(jwt, {
+    transcription_config: {
+      language: "en",
+      operating_point: "enhanced",
+      max_delay: 1.0,
+      transcript_filtering_config: {
+        remove_disfluencies: true,
+      },
+    },
+  });
+
+  const stream = https.get(streamURL, (response) => {
+    // Handle the response stream
+    response.on("data", (chunk) => {
+      client.sendAudio(chunk);
+    });
+
+    response.on("end", () => {
+      console.log("Stream ended");
+      client.stopRecognition({ noTimeout: true });
+    });
+
+    response.on("error", (error) => {
+      console.error("Stream error:", error);
+      client.stopRecognition();
+    });
+  });
+
+  stream.on("error", (error) => {
+    console.error("Request error:", error);
+    client.stopRecognition();
+  });
+}
+
+transcribe();
+```
+
+```
+import speechmatics
+from httpx import HTTPStatusError
+from urllib.request import urlopen
+
+API_KEY = "YOUR_API_KEY"
+LANGUAGE = "en"
+CONNECTION_URL = "wss://eu.rt.speechmatics.com/v2"
+
+# The raw audio stream will be a few seconds ahead of the radio
+AUDIO_STREAM_URL = "https://media-ice.musicradio.com/LBCUKMP3"  # LBC Radio stream
+
+audio_stream = urlopen(AUDIO_STREAM_URL)
+
+# Create a transcription client
+ws = speechmatics.client.WebsocketClient(
+    speechmatics.models.ConnectionSettings(
+        url=CONNECTION_URL,
+        auth_token=API_KEY,
+    )
+)
+
+
+# Define an event handler to print the partial transcript
+def print_partial_transcript(msg):
+    print(f"[partial] {msg['metadata']['transcript']}")
+
+
+# Define an event handler to print the full transcript
+def print_transcript(msg):
+    print(f"[   FULL] {msg['metadata']['transcript']}")
+
+
+# Register the event handler for partial transcript
+ws.add_event_handler(
+    event_name=speechmatics.models.ServerMessageType.AddPartialTranscript,
+    event_handler=print_partial_transcript,
+)
+
+# Register the event handler for full transcript
+ws.add_event_handler(
+    event_name=speechmatics.models.ServerMessageType.AddTranscript,
+    event_handler=print_transcript,
+)
+
+settings = speechmatics.models.AudioSettings()
+
+# Define transcription parameters
+# Full list of parameters described here: https://speechmatics.github.io/speechmatics-python/models
+conf = speechmatics.models.TranscriptionConfig(
+    operating_point="enhanced",
+    language=LANGUAGE,
+    enable_partials=True,
+    max_delay=1,
+)
+
+print("Starting transcription (type Ctrl-C to stop):")
+try:
+    ws.run_synchronously(audio_stream, conf, settings)
+except KeyboardInterrupt:
+    print("\nTranscription stopped.")
+except HTTPStatusError as e:
+    if e.response.status_code == 401:
+        print("Invalid API key - Check your API_KEY at the top of the code!")
+    else:
+        raise e
+```
+
+## Transcript outputs[​](#transcript-outputs "Direct link to Transcript outputs")
+
+The API returns transcripts in JSON format. You can receive two types of output: [Final](#final-transcripts) and [Partial](#partial-transcripts) transcripts. Choose the type based on your latency and accuracy needs.
+
+### Final transcripts[​](#final-transcripts "Direct link to Final transcripts")
+
+Final transcripts are the definitive result.
+
+* They reflect the best transcription for the spoken audio.
+* Once displayed, they are not updated.
+* Words arrive incrementally, with some delay.
+
+You control the latency and accuracy tradeoff [using the `max_delay` setting](/speech-to-text/realtime/output.md#latency) in your `transcription_config`. Larger values of `max_delay` increase accuracy by giving the system more time to process audio context.
+
+Best for accurate, completed transcripts where some delay is acceptable
+
+### Partial transcripts[​](#partial-transcripts "Direct link to Partial transcripts")
+
+Partial transcripts are low-latency and can update later as more conversation context arrives.
+
+* You must enable them using `enable_partials` in your `transcription_config`.
+* Partials are emitted quickly (typically less than 500ms).
+* The engine may revise them as more audio is processed.
+
+You can combine partials with finals for a responsive user experience — show partials first, then replace them with finals as they arrive.
+
+You control the latency and accuracy tradeoff using the [`max_delay` setting](/speech-to-text/realtime/output.md#latency) in your `transcription_config`.
+
+Use partials for: real-time captions, voice interfaces, or any case where speed matters
+---
+# Input
+
+Learn about the supported input audio formats for the Speechmatics Realtime API
+
+## Supported input audio formats[​](#supported-input-audio-formats "Direct link to Supported input audio formats")
+
+Sessions can be configured to use two types of audio input: `file` and `raw`.<br /><!-- -->We recommend using the `raw` option, unless you have a specific reason to use the `file` option.
+
+For capturing raw audio in the browser, try our [`browser-audio-input` package](https://www.npmjs.com/package/@speechmatics/browser-audio-input).
+
+### `audio_format`[​](#audio_format "Direct link to audio_format")
+
+The format must be supplied in the `audio_format` field of the `StartRecognition` message. See the [API reference](/api-ref/realtime-transcription-websocket.md#startrecognition).
+
+oneOf
+
+* Raw
+* File
+
+Raw audio samples, described by the following additional mandatory fields:
+
+**type**required
+
+Constant value: `raw`
+
+**encoding**stringrequired
+
+Possible values: \[`pcm_f32le`, `pcm_s16le`, `mulaw`]
+
+**sample\_rate**integerrequired
+
+The sample rate of the audio in Hz.
+
+**Example**: `{"type":"raw","encoding":"pcm_s16le","sample_rate":44100}`
+
+Choose this option to send audio encoded in a recognized format. The AddAudio messages have to provide all the file contents, including any headers. The file is usually not accepted all at once, but segmented into reasonably sized messages.
+
+Note: Only the following formats are supported: `wav`, `mp3`, `aac`, `ogg`, `mpeg`, `amr`, `m4a`, `mp4`, `flac`
+
+**type**required
+
+Constant value: `file`
+
+## Sending audio[​](#sending-audio "Direct link to Sending audio")
+
+After receiving a `RecognitionStarted` message, you can start sending audio over the Websocket connection. Audio is sent as binary data, encoded in the format specified in the `StartRecognition` message. See [Protocol overview](/api-ref/realtime-transcription-websocket.md#protocol-overview) for complete details of the API protocol.
+
+## Next steps[​](#next-steps "Direct link to Next steps")
+
+View our guides:
+
+* [using a microphone](/speech-to-text/realtime/guides/python-using-microphone.md) to learn how to capture audio from a microphone.
+* [using FFMPEG](/speech-to-text/realtime/guides/python-using-ffmpeg.md) to find out how to pipe microphone audio to the API.
+---
+# Output
+
+Learn about latency in the Speechmatics Realtime server
+
+The Realtime API returns transcription output, and other information through a variety of messages, see [Received Messages](/api-ref/realtime-transcription-websocket.md#received-messages).
+
+Which messages are returned, and how frequently, depends on how the session is configured in the [StartRecognition](/api-ref/realtime-transcription-websocket.md#startrecognition) message.
+
+## Latency[​](#latency "Direct link to Latency")
+
+When transcribing in real-time, you can control the maximum time to wait for the final transcript. This could be as fast as 0.7 seconds, though allowing a longer time will give a slight accuracy improvement.
+
+For even faster output, use [Partial transcripts](#partial-transcripts) to receive transcription output before higher-accuracy final transcripts are returned.
+
+### Configuration example[​](#configuration-example "Direct link to Configuration example")
+
+The following example shows a typical configuration for low latency applications. Include this in the [StartRecognition](/api-ref/realtime-transcription-websocket.md#startrecognition) message.
+
+```
+{
+  "type": "transcription",
+  "transcription_config": {
+    "language": "en",
+    "operating_point": "enhanced",
+    "max_delay": 0.7,
+    "max_delay_mode": "flexible",
+    "enable_partials": true,
+
+  }
+}
+```
+
+* `max_delay` (Number): Optional. Allowed between 0.7 and 4 seconds. Default is 4 seconds. This is the delay in seconds between the end of a spoken word and returning the Final transcript results. Note that there is a very small amount of additional latency while the server is sending the transcript to the client.
+* `max_delay_mode` (String): Optional. Allowed values are `fixed` and `flexible`. Default is `flexible`. This allows some additional time for [Numeral Formatting](#smart-formatting).
+* `enable_partials` (Boolean): Default is false. Whether or not to receive [Partial transcripts](#partial-transcripts) before the Final transcripts are received.
+
+## Accuracy/Latency trade-offs[​](#accuracylatency-trade-offs "Direct link to Accuracy/Latency trade-offs")
+
+We recommend experimenting with different settings for the `max_delay` to find the right trade-off between accuracy and latency for your application.
+
+Based on our own testing and experience, we can offer a few guidelines on `max_delay` settings to get you started:
+
+* **0.7 - 1.5 seconds**: For use cases where an ultra-fast response is needed such as voice agents. This gives a minor accuracy degradation of less than 5% relative to the Batch transcription service.
+* **2.0 seconds**: Recommended for most use cases, needing the optimal trade-off between acccuracy and latency, such as captioning or contact centres. This gives a negligible degradation of around 1% relative to the Batch transcription service.
+* **4.0 seconds**: For use cases where accuracy is more important than latency, such as legal transcription. This gives accuracy equivalent to our Batch transcription service. You can also use Partial transcripts to give users early feedback of the recognized text.
+
+## Partial transcripts[​](#partial-transcripts "Direct link to Partial transcripts")
+
+Partial transcripts allow you to receive preliminary transcription and update as more context is available until the higher-accuracy [Finals](/api-ref/realtime-transcription-websocket.md#addtranscript) are returned. Typically Partials are returned in less than 500 milliseconds. Partials latency is not affected by the `max_delay` setting.
+
+[Partial transcripts](/api-ref/realtime-transcription-websocket.md#addpartialtranscript) are enabled using the `enable_partials` config option. For example:
+
+```
+{
+  "type": "transcription",
+  "transcription_config": {
+    "language": "en",
+    "operating_point": "enhanced",
+    "max_delay": 2,
+    "enable_partials": true,
+  }
+}
+```
+
+On each Final transcript you will immediately receive a Partial transcript with any remaining words which have not been finalized.
+
+Note that Partial transcripts have some limitations:
+
+* Accuracy is usually 10-25% lower than the Final transcript. This includes punctuation and capitalization of words.
+* The `confidence` field for Partial transcripts has no meaning and should not be relied on.
+
+## Smart formatting[​](#smart-formatting "Direct link to Smart formatting")
+
+[Smart Formatting](/speech-to-text/formatting.md#smart-formatting) ensures readability of your transcripts by formatting numbers, dates, currencies and other important *entities* into their written form.
+
+When the `max_delay_mode` is set to `flexible`, and an entity is being spoken, the Final transcript would be delayed until the entity is fully spoken to enable proper formatting. This option should be used in most use-cases for improved accuracy and readability for numbers, currencies, and dates.
+
+If you have strict latency requirements, and prefer not to wait for entity formatting to complete, set `max_delay_mode` to `fixed`. Note that in this mode, there will be some reduction in accuracy and readability for numbers, currencies, and dates.
+
+## Example outputs (partials and finals)[​](#example-outputs-partials-and-finals "Direct link to Example outputs (partials and finals)")
+
+With only `Finals` and default `max_delay_mode`, messages received could look like the following:
+
+* **(Final)**: I am 35.
+
+**Final output**: I am 35.
+
+With `Partials` enabled and default `max_delay_mode`, messages received could look like the following:
+
+* **(Partial)**: I
+* **(Partial)**: I am
+* **(partial)**: I am third
+* **(Partial)**: I am 30
+* **(Final)**: I am 35.
+
+**Final output**: I am 35.
+
+With `Partials` enabled and `max_delay_mode` as `fixed`, messages received could look like the following:
+
+* **(Partial)**: I
+* **(Final)**: I am
+* **(partial)**: third
+* **(Final)**: 30
+* **(Partial)**: five
+* **(Final)**: five.
+
+**Final output**: I am 30 five.
+---
+# Limits – Realtime
+
+Learn about the limits for the Speechmatics Realtime API
+
+Speechmatics limits the number of hours of audio users can process each month to help manage load on our servers. The current limits (in hours) by account type are listed in the table below:
+
+|            | Max. hours per month | Max. concurrent sessions |
+| ---------- | -------------------- | ------------------------ |
+| Free Tier  | 4                    | 2                        |
+| Paid Tier  | 6,000                | 50                       |
+| Enterprise | Custom               | Custom                   |
+
+Please reach out to [Support](https://support.speechmatics.com) if you need to increase the above limits.
+
+### Session limits[​](#session-limits "Direct link to Session limits")
+
+Realtime SaaS sessions will be automatically ended if any of the following criteria are met:
+
+* Session duration reaches 48 hours
+* No audio data (AddAudio messages) sent for 1 hour
+* No audio or ping/pongs sent for 3 minutes.
+
+When a session is automatically ended, the Realtime SaaS service will send an in-band error followed by a closing handshake with code `1008`. For more information, see the [Realtime API Reference](/api-ref/realtime-transcription-websocket.md#error).
+
+### Guidance for users[​](#guidance-for-users "Direct link to Guidance for users")
+
+Clients can disconnect a session before it is automatically terminated and immediately reconnect a new session. Note that new sessions will typically start in less than a second. If seamless transition is required, the new session can be connected a few seconds before disconnecting the old session.
+
+Since unpredictable network issues can cause WebSocket connections to be dropped, we recommend graceful handling of session termination for long-running sessions.
+
+## Data retention limits[​](#data-retention-limits "Direct link to Data retention limits")
+
+Speechmatics Realtime SaaS does not store audio files, transcripts, or configuration data.
+----
+# Realtime API Reference
+
+```
+GET
+wss://eu.rt.speechmatics.com/v2/
+```
+
+## Protocol overview[​](#protocol-overview "Direct link to Protocol overview")
+
+A basic Realtime session will have the following message exchanges:
+
+<!-- -->
+
+#### Browser based transcription[​](#browser-based-transcription "Direct link to Browser based transcription")
+
+When starting a Realtime transcription session **in the browser**, [temporary keys](/get-started/authentication.md#temporary-keys) should be used to avoid exposing your long-lived API key.
+
+To do so, you must provide the temporary key as a part of a query parameter. This is due to a browser limitation. For example:
+
+```
+ wss://eu.rt.speechmatics.com/v2?jwt=<temporary-key>
+```
+
+### Handshake responses[​](#handshake-responses "Direct link to Handshake responses")
+
+**Successful Response**
+
+* `101 Switching Protocols` - Switch to WebSocket protocol
+
+Here is an example for a successful WebSocket handshake:
+
+```
+GET /v2/ HTTP/1.1
+Host: eu.rt.speechmatics.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: ujRTbIaQsXO/0uCbjjkSZQ==
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits
+Authorization: Bearer wmz9fkLJM6U5NdyaG3HLHybGZj65PXp
+User-Agent: Python/3.8 websockets/8.1
+```
+
+A successful response should look like:
+
+```
+HTTP/1.1 101 Switching Protocols
+Server: nginx/1.17.8
+Date: Wed, 06 Jan 2021 11:01:05 GMT
+Connection: upgrade
+Upgrade: WebSocket
+Sec-WebSocket-Accept: 87kiC/LI5WgXG52nSylnfXdz260=
+```
+
+**Malformed request**
+
+A malformed handshake request will result in one of the following HTTP responses:
+
+* `400 Bad Request`
+* `401 Unauthorized` - when the API key is not valid
+* `405 Method Not Allowed` - when the request method is not GET
+
+**Client Retry**
+
+Following a successful handshake and switch to the WebSocket protocol, the client could receive an immediate error message and WebSocket close handshake from the server. For the following errors only, we recommend adding a client retry interval of at least 5-10 seconds:
+
+* `4005 quota_exceeded`
+* `4013 job_error`
+* `1011 internal_error`
+
+## Message handling[​](#message-handling "Direct link to Message handling")
+
+Each message that the **Server** accepts is a stringified JSON object with the following fields:
+
+* `message` (String): The name of the message we are sending. Any other fields depend on the value of the `message` and are described below.
+
+The messages sent by the **Server** to a **Client** are stringified JSON objects as well.
+
+The only exception is a binary message sent from the **Client** to the **Server** containing a chunk of audio which will be referred to as `AddAudio`.
+
+The following values of the `message` field are supported:
+
+## Sent messages[​](#sent-messages "Direct link to Sent messages")
+
+### <!-- -->StartRecognition[​](#startrecognition "Direct link to startrecognition")
+
+See example
+
+Initiates a new recognition session.
+
+**message**required
+
+Constant value: `StartRecognition`
+
+**audio\_format** <!-- -->objectrequired
+
+oneOf
+
+* Raw
+* File
+
+Raw audio samples, described by the following additional mandatory fields:
+
+**type**required
+
+Constant value: `raw`
+
+**encoding**stringrequired
+
+Possible values: \[`pcm_f32le`, `pcm_s16le`, `mulaw`]
+
+**sample\_rate**integerrequired
+
+The sample rate of the audio in Hz.
+
+**Example**: `{"type":"raw","encoding":"pcm_s16le","sample_rate":44100}`
+
+Choose this option to send audio encoded in a recognized format. The AddAudio messages have to provide all the file contents, including any headers. The file is usually not accepted all at once, but segmented into reasonably sized messages.
+
+Note: Only the following formats are supported: `wav`, `mp3`, `aac`, `ogg`, `mpeg`, `amr`, `m4a`, `mp4`, `flac`
+
+**type**required
+
+Constant value: `file`
+
+**transcription\_config** <!-- -->objectrequired
+
+Contains configuration for this recognition session.
+
+**language**stringrequired
+
+Language model to process the audio input, normally specified as an ISO language code. The value must be consistent with the language code used in the API endpoint URL.
+
+**Example:&#x20;**`en`
+
+**domain**string
+
+Request a specialized model based on 'language' but optimized for a particular field, e.g. `finance` or `medical`.
+
+**output\_locale**string
+
+Configure locale for outputted transcription. See [output formatting](https://docs.speechmatics.com/speech-to-text/formatting#output-locale).
+
+Possible values: `non-empty`
+
+**additional\_vocab** <!-- -->object\[]
+
+Configure [custom dictionary](https://docs.speechmatics.com/speech-to-text/features/custom-dictionary). Default is an empty list. You should be aware that there is a performance penalty (latency degradation and memory increase) from using `additional_vocab`, especially if you use a large word list. When initializing a session that uses `additional_vocab` in the config, you should expect a delay of up to 15 seconds (depending on the size of the list).
+
+* Array \[
+
+oneOf
+
+* String
+* Object
+
+Pass a non-empty string to add a single word to the dictionary.
+
+****string
+
+Pass a non-empty string to add a single word to the dictionary.
+
+Possible values: `non-empty`
+
+Pass an object to add a single word to the dictionary, with an array of words which it sounds like.
+
+**content**stringrequired
+
+Possible values: `non-empty`
+
+**sounds\_like**string\[]
+
+Possible values: `>= 1`
+
+* ]
+
+**diarization**string
+
+Set to `speaker` to apply [Speaker Diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) to the audio.
+
+Possible values: \[`none`, `speaker`, `channel`, `channel_and_speaker`]
+
+**Default value:&#x20;**`none`
+
+**max\_delay**number
+
+This is the delay in seconds between the end of a spoken word and returning the Final transcript results. See [Latency](https://docs.speechmatics.com/speech-to-text/realtime/output#latency) for more details
+
+Possible values: `>= 0.7` and `<= 4`
+
+**Default value:&#x20;**`4`
+
+**max\_delay\_mode**string
+
+This allows some additional time for [Smart Formatting](https://docs.speechmatics.com/speech-to-text/formatting#smart-formatting).
+
+Possible values: \[`flexible`, `fixed`]
+
+**Default value:&#x20;**`flexible`
+
+**speaker\_diarization\_config** <!-- -->object
+
+**max\_speakers**integer
+
+Configure the maximum number of speakers to detect. See [Max Speakers](http://docs.speechmatics.com/speech-to-text/features/diarization#max-speakers).
+
+Possible values: `>= 2`
+
+**prefer\_current\_speaker**boolean
+
+When set to `true`, reduces the likelihood of incorrectly switching between similar sounding speakers. See [Prefer Current Speaker](https://docs.speechmatics.com/speech-to-text/features/diarization#prefer-current-speaker).
+
+**Default value:&#x20;**`false`
+
+**speaker\_sensitivity**float
+
+Possible values: `>= 0` and `<= 1`
+
+**get\_speakers**boolean
+
+If true, speaker identifiers will be returned at the end of transcript.
+
+**speakers** <!-- -->object\[]
+
+Use this option to provide speaker labels linked to their speaker identifiers. When passed, the transcription system will tag spoken words in the transcript with the provided speaker labels whenever any of the specified speakers is detected in the audio. A maximum of 50 speakers identifiers across all speakers can be provided.
+
+* Array \[
+
+**label**stringrequired
+
+Speaker label, which must not match the format used internally (e.g. S1, S2, etc)
+
+Possible values: `non-empty`
+
+**speaker\_identifiers**bytes\[]required
+
+Possible values: `>= 1`
+
+* ]
+
+**audio\_filtering\_config** <!-- -->object
+
+Puts a lower limit on the volume of processed audio by using the `volume_threshold` setting. See [Audio Filtering](https://docs.speechmatics.com/speech-to-text/features/audio-filtering).
+
+**volume\_threshold**float
+
+Possible values: `>= 0` and `<= 100`
+
+**transcript\_filtering\_config** <!-- -->object
+
+**remove\_disfluencies**boolean
+
+When set to `true`, removes disfluencies from the transcript. See [Removing disfluencies](https://docs.speechmatics.com/speech-to-text/formatting#removing-disfluencies)
+
+**replacements** <!-- -->object\[]
+
+A list of replacement rules to apply to the transcript. Each rule consists of a pattern to match and a replacement string. See [Word replacement](https://docs.speechmatics.com/speech-to-text/formatting#word-replacement)
+
+* Array \[
+
+**from**stringrequired
+
+**to**stringrequired
+
+* ]
+
+**enable\_partials**boolean
+
+Whether or not to send Partials (i.e. `AddPartialTranslation` messages) as well as Finals (i.e. `AddTranslation` messages) See [Partial transcripts](https://docs.speechmatics.com/speech-to-text/realtime/output#partial-transcripts).
+
+**Default value:&#x20;**`false`
+
+**enable\_entities**boolean
+
+**Default value:&#x20;**`true`
+
+**operating\_point**string
+
+Which model you wish to use. See [Operating points](http://docs.speechmatics.com/speech-to-text/#operating-points) for more details.
+
+Possible values: \[`standard`, `enhanced`]
+
+**Default value:&#x20;**`standard`
+
+**punctuation\_overrides** <!-- -->object
+
+Options for controlling punctuation in the output transcripts. See [Punctuation Settings](https://docs.speechmatics.com/speech-to-text/formatting#punctuation)
+
+**permitted\_marks**string\[]
+
+The punctuation marks which the client is prepared to accept in transcription output, or the special value 'all' (the default). Unsupported marks are ignored. This value is used to guide the transcription process.
+
+Possible values: Value must match regular expression `^(.|all)$`
+
+**sensitivity**float
+
+Ranges between zero and one. Higher values will produce more punctuation. The default is 0.5.
+
+Possible values: `>= 0` and `<= 1`
+
+**conversation\_config** <!-- -->object
+
+This mode will detect when a speaker has stopped talking. The `end_of_utterance_silence_trigger` is the time in seconds after which the server will assume that the speaker has finished speaking, and will emit an `EndOfUtterance` message. A value of 0 disables the feature.
+
+**end\_of\_utterance\_silence\_trigger**float
+
+Possible values: `>= 0` and `<= 2`
+
+**Default value:&#x20;**`0`
+
+**channel\_diarization\_labels**string\[]
+
+**translation\_config** <!-- -->object
+
+Specifies various configuration values for translation. All fields except `target_languages` are optional, using default values when omitted.
+
+**target\_languages**string\[]required
+
+List of languages to translate to from the source transcription `language`. Specified as an [ISO Language Code](https://docs.speechmatics.com/speech-to-text/languages).
+
+**enable\_partials**boolean
+
+Whether or not to send Partials (i.e. `AddPartialTranslation` messages) as well as Finals (i.e. `AddTranslation` messages).
+
+**Default value:&#x20;**`false`
+
+**audio\_events\_config** <!-- -->object
+
+Contains configuration for [Audio Events](https://docs.speechmatics.com/speech-to-text/features/audio-events)
+
+**types**string\[]
+
+List of [Audio Event types](https://docs.speechmatics.com/speech-to-text/features/audio-events#supported-audio-events) to enable.
+
+### <!-- -->AddAudio[​](#addaudio "Direct link to addaudio")
+
+A binary chunk of audio. The server confirms receipt by sending an AudioAdded message.
+
+**string**binary
+
+### <!-- -->AddChannelAudio[​](#addchannelaudio "Direct link to addchannelaudio")
+
+Audio belonging to a specific channel.
+
+**message**required
+
+Constant value: `AddChannelAudio`
+
+**channel**stringrequired
+
+The channel identifier to which the audio belongs.
+
+**data**stringrequired
+
+The audio data in base64 format.
+
+### <!-- -->EndOfStream[​](#endofstream "Direct link to endofstream")
+
+Declares that the client has no more audio to send.
+
+**message**required
+
+Constant value: `EndOfStream`
+
+**last\_seq\_no**integerrequired
+
+### <!-- -->EndOfChannel[​](#endofchannel "Direct link to endofchannel")
+
+Declares that the channel has no more audio to send.
+
+**message**required
+
+Constant value: `EndOfChannel`
+
+**channel**stringrequired
+
+The channel identifier to which the audio belongs.
+
+**last\_seq\_no**integerrequired
+
+### <!-- -->ForceEndOfUtterance[​](#forceendofutterance "Direct link to forceendofutterance")
+
+Requests a finalized transcript.
+
+**message**required
+
+Constant value: `ForceEndOfUtterance`
+
+**channel**string
+
+The channel to request finalized transcript from. This field is only seen in multichannel.
+
+### <!-- -->SetRecognitionConfig[​](#setrecognitionconfig "Direct link to setrecognitionconfig")
+
+Allows the client to re-configure the recognition session.
+
+The language field can be included in SetRecognitionConfig, but its value must match the language specified in the initial StartRecognition message. Attempting to change the language or any other transcription configuration parameter not listed below will result in an error.
+
+**message**required
+
+Constant value: `SetRecognitionConfig`
+
+**transcription\_config** <!-- -->objectrequired
+
+Contains configuration for this recognition session.
+
+**language**string
+
+Language model to process the audio input, normally specified as an ISO language code. The value must be consistent with the language code used in the API endpoint URL.
+
+**Example:&#x20;**`en`
+
+**max\_delay**number
+
+This is the delay in seconds between the end of a spoken word and returning the Final transcript results. See [Latency](https://docs.speechmatics.com/speech-to-text/realtime/output#latency) for more details
+
+Possible values: `>= 0.7` and `<= 4`
+
+**Default value:&#x20;**`4`
+
+**max\_delay\_mode**string
+
+This allows some additional time for [Smart Formatting](https://docs.speechmatics.com/speech-to-text/formatting#smart-formatting).
+
+Possible values: \[`flexible`, `fixed`]
+
+**Default value:&#x20;**`flexible`
+
+**audio\_filtering\_config** <!-- -->object
+
+Puts a lower limit on the volume of processed audio by using the `volume_threshold` setting. See [Audio Filtering](https://docs.speechmatics.com/speech-to-text/features/audio-filtering).
+
+**volume\_threshold**float
+
+Possible values: `>= 0` and `<= 100`
+
+**enable\_partials**boolean
+
+Whether or not to send Partials (i.e. `AddPartialTranslation` messages) as well as Finals (i.e. `AddTranslation` messages) See [Partial transcripts](https://docs.speechmatics.com/speech-to-text/realtime/output#partial-transcripts).
+
+**Default value:&#x20;**`false`
+
+**conversation\_config** <!-- -->object
+
+This mode will detect when a speaker has stopped talking. The `end_of_utterance_silence_trigger` is the time in seconds after which the server will assume that the speaker has finished speaking, and will emit an `EndOfUtterance` message. A value of 0 disables the feature.
+
+**end\_of\_utterance\_silence\_trigger**float
+
+Possible values: `>= 0` and `<= 2`
+
+**Default value:&#x20;**`0`
+
+### <!-- -->GetSpeakers[​](#getspeakers "Direct link to getspeakers")
+
+Requests any detected speaker identifiers to be returned.
+
+**message**required
+
+Constant value: `GetSpeakers`
+
+**final**boolean
+
+Optional. This flag controls when speaker identifiers are returned. Defaults to false if omitted. When false, multiple GetSpeakers requests can be sent during transcription, each returning the speaker identifiers generated so far. To reduce the chance of empty results, send requests after at least one TranscriptAdded message is received to make sure that the server has processed some audio. When true, speaker identifiers are returned only once at the end of the transcription, regardless of how many final: true requests are sent. Even with final: true requests, you can still send final: false requests to receive intermediate speaker identifier updates.
+
+## Received messages[​](#received-messages "Direct link to Received messages")
+
+### <!-- -->RecognitionStarted[​](#recognitionstarted "Direct link to recognitionstarted")
+
+See example
+
+Server response to StartRecognition, acknowledging that a recognition session has started.
+
+**message**required
+
+Constant value: `RecognitionStarted`
+
+**orchestrator\_version**string
+
+**id**string
+
+**language\_pack\_info** <!-- -->object
+
+Properties of the language pack.
+
+**language\_description**string
+
+Full descriptive name of the language, e.g. 'Japanese'.
+
+**word\_delimiter**stringrequired
+
+The character to use to separate words.
+
+**writing\_direction**string
+
+The direction that words in the language should be written and read in.
+
+Possible values: \[`left-to-right`, `right-to-left`]
+
+**itn**boolean
+
+Whether or not ITN (inverse text normalization) is available for the language pack.
+
+**adapted**boolean
+
+Whether or not language model adaptation has been applied to the language pack.
+
+**channel\_ids**string\[]
+
+### <!-- -->AudioAdded[​](#audioadded "Direct link to audioadded")
+
+Server response to AddAudio, indicating that audio has been added successfully.
+
+When clients send audio faster than real-time, the server may read data slower than it's sent. If binary `AddAudio` messages exceed the server's internal buffer, the server will process other WebSocket messages until buffer space is available. Clients receive `AudioAdded` responses only after binary data is read. This can fill TCP buffers, potentially causing WebSocket write failures and connection closure [with prejudice](https://websockets.spec.whatwg.org#the-closeevent-interface). Clients can monitor the WebSocket's [`bufferedAmount`](https://www.w3.org/TR/websockets#dom-websocket-bufferedamount) attribute to prevent this.
+
+**message**required
+
+Constant value: `AudioAdded`
+
+**seq\_no**integerrequired
+
+### <!-- -->ChannelAudioAdded[​](#channelaudioadded "Direct link to channelaudioadded")
+
+Server response to AddChannelAudio, indicating that audio has been added successfully.
+
+**message**required
+
+Constant value: `ChannelAudioAdded`
+
+**seq\_no**integerrequired
+
+**channel**stringrequired
+
+### <!-- -->AddPartialTranscript[​](#addpartialtranscript "Direct link to addpartialtranscript")
+
+A partial transcript is a transcript that can be changed in a future `AddPartialTranscript` as more words are spoken until the `AddTranscript` **Final** message is sent for that audio.
+
+Partials will only be sent if `transcription_config.enable_partials` is set to `true` in the `StartRecognition` message.
+
+The message structure is the same as `AddTranscript`, with a few [limitations](https://docs.speechmatics.com/speech-to-text/realtime/output#partial-transcripts).
+
+For `AddPartialTranscript` messages the `confidence` field for `alternatives` has no meaning and should not be relied on.
+
+**message**required
+
+Constant value: `AddPartialTranscript`
+
+**format**string
+
+Speechmatics JSON output format version number.
+
+**Example:&#x20;**`2.1`
+
+**metadata** <!-- -->objectrequired
+
+**start\_time**floatrequired
+
+**end\_time**floatrequired
+
+**transcript**stringrequired
+
+The entire transcript contained in the segment in text format. Providing the entire transcript here is designed for ease of consumption; we have taken care of all the necessary formatting required to concatenate the transcription results into a block of text. This transcript lacks the detailed information however which is contained in the `results` field of the message - such as the timings and confidences for each word.
+
+**results** <!-- -->object\[]required
+
+* Array \[
+
+**type**stringrequired
+
+Possible values: \[`word`, `punctuation`, `entity`]
+
+**start\_time**floatrequired
+
+**end\_time**floatrequired
+
+**attaches\_to**string
+
+Possible values: \[`next`, `previous`, `none`, `both`]
+
+**is\_eos**boolean
+
+**alternatives** <!-- -->object\[]
+
+* Array \[
+
+**content**stringrequired
+
+A word or punctuation mark.
+
+**confidence**floatrequired
+
+A confidence score assigned to the alternative. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+**language**string
+
+The language that the alternative word is assumed to be spoken in. Currently, this will always be equal to the language that was requested in the initial `StartRecognition` message.
+
+**display** <!-- -->object
+
+Information about how the word/symbol should be displayed.
+
+**direction**stringrequired
+
+Either `ltr` for words that should be displayed left-to-right, or `rtl` vice versa.
+
+Possible values: \[`ltr`, `rtl`]
+
+**speaker**string
+
+Label indicating who said that word. Only set if [diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) is enabled.
+
+**tags**string\[]
+
+This is a set list of profanities and disfluencies respectively that cannot be altered by the end user. `[disfluency]` is only present in English, and `[profanity]` is present in English, Spanish, and Italian
+
+Possible values: \[`disfluency`, `profanity`]
+
+* ]
+
+**volume**float
+
+Possible values: `>= 0` and `<= 100`
+
+**entity\_class**string
+
+For 'entity' results only, the class the entity has been formatted as. Examples: 'date', 'money', 'number'
+
+**spoken\_form** <!-- -->object\[]
+
+For 'entity' results only, the spoken\_form is the transcript of the individual words directly spoken.
+
+* Array \[
+
+**alternatives** <!-- -->object\[]required
+
+* Array \[
+
+**content**stringrequired
+
+A word or punctuation mark.
+
+**confidence**floatrequired
+
+A confidence score assigned to the alternative. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+**language**string
+
+The language that the alternative word is assumed to be spoken in. Currently, this will always be equal to the language that was requested in the initial `StartRecognition` message.
+
+**display** <!-- -->object
+
+Information about how the word/symbol should be displayed.
+
+**direction**stringrequired
+
+Either `ltr` for words that should be displayed left-to-right, or `rtl` vice versa.
+
+Possible values: \[`ltr`, `rtl`]
+
+**speaker**string
+
+Label indicating who said that word. Only set if [diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) is enabled.
+
+**tags**string\[]
+
+This is a set list of profanities and disfluencies respectively that cannot be altered by the end user. `[disfluency]` is only present in English, and `[profanity]` is present in English, Spanish, and Italian
+
+Possible values: \[`disfluency`, `profanity`]
+
+* ]
+
+**end\_time**floatrequired
+
+**start\_time**floatrequired
+
+**type**stringrequired
+
+Possible values: \[`word`, `punctuation`]
+
+* ]
+
+**written\_form** <!-- -->object\[]
+
+For 'entity' results only, the written\_form is a standardized form of the spoken words. It contains the formatted entity split into individual words.
+
+* Array \[
+
+**alternatives** <!-- -->object\[]required
+
+* Array \[
+
+**content**stringrequired
+
+A word or punctuation mark.
+
+**confidence**floatrequired
+
+A confidence score assigned to the alternative. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+**language**string
+
+The language that the alternative word is assumed to be spoken in. Currently, this will always be equal to the language that was requested in the initial `StartRecognition` message.
+
+**display** <!-- -->object
+
+Information about how the word/symbol should be displayed.
+
+**direction**stringrequired
+
+Either `ltr` for words that should be displayed left-to-right, or `rtl` vice versa.
+
+Possible values: \[`ltr`, `rtl`]
+
+**speaker**string
+
+Label indicating who said that word. Only set if [diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) is enabled.
+
+**tags**string\[]
+
+This is a set list of profanities and disfluencies respectively that cannot be altered by the end user. `[disfluency]` is only present in English, and `[profanity]` is present in English, Spanish, and Italian
+
+Possible values: \[`disfluency`, `profanity`]
+
+* ]
+
+**end\_time**floatrequired
+
+**start\_time**floatrequired
+
+**type**stringrequired
+
+Possible values: \[`word`]
+
+* ]
+
+* ]
+
+**channel**string
+
+The channel identifier to which the audio belongs. This field is only seen in multichannel.
+
+### <!-- -->AddTranscript[​](#addtranscript "Direct link to addtranscript")
+
+Contains the final transcript of a part of the audio that the client has sent.
+
+**message**required
+
+Constant value: `AddTranscript`
+
+**format**string
+
+Speechmatics JSON output format version number.
+
+**Example:&#x20;**`2.1`
+
+**metadata** <!-- -->objectrequired
+
+**start\_time**floatrequired
+
+**end\_time**floatrequired
+
+**transcript**stringrequired
+
+The entire transcript contained in the segment in text format. Providing the entire transcript here is designed for ease of consumption; we have taken care of all the necessary formatting required to concatenate the transcription results into a block of text. This transcript lacks the detailed information however which is contained in the `results` field of the message - such as the timings and confidences for each word.
+
+**results** <!-- -->object\[]required
+
+* Array \[
+
+**type**stringrequired
+
+Possible values: \[`word`, `punctuation`, `entity`]
+
+**start\_time**floatrequired
+
+**end\_time**floatrequired
+
+**attaches\_to**string
+
+Possible values: \[`next`, `previous`, `none`, `both`]
+
+**is\_eos**boolean
+
+**alternatives** <!-- -->object\[]
+
+* Array \[
+
+**content**stringrequired
+
+A word or punctuation mark.
+
+**confidence**floatrequired
+
+A confidence score assigned to the alternative. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+**language**string
+
+The language that the alternative word is assumed to be spoken in. Currently, this will always be equal to the language that was requested in the initial `StartRecognition` message.
+
+**display** <!-- -->object
+
+Information about how the word/symbol should be displayed.
+
+**direction**stringrequired
+
+Either `ltr` for words that should be displayed left-to-right, or `rtl` vice versa.
+
+Possible values: \[`ltr`, `rtl`]
+
+**speaker**string
+
+Label indicating who said that word. Only set if [diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) is enabled.
+
+**tags**string\[]
+
+This is a set list of profanities and disfluencies respectively that cannot be altered by the end user. `[disfluency]` is only present in English, and `[profanity]` is present in English, Spanish, and Italian
+
+Possible values: \[`disfluency`, `profanity`]
+
+* ]
+
+**volume**float
+
+Possible values: `>= 0` and `<= 100`
+
+**entity\_class**string
+
+For 'entity' results only, the class the entity has been formatted as. Examples: 'date', 'money', 'number'
+
+**spoken\_form** <!-- -->object\[]
+
+For 'entity' results only, the spoken\_form is the transcript of the individual words directly spoken.
+
+* Array \[
+
+**alternatives** <!-- -->object\[]required
+
+* Array \[
+
+**content**stringrequired
+
+A word or punctuation mark.
+
+**confidence**floatrequired
+
+A confidence score assigned to the alternative. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+**language**string
+
+The language that the alternative word is assumed to be spoken in. Currently, this will always be equal to the language that was requested in the initial `StartRecognition` message.
+
+**display** <!-- -->object
+
+Information about how the word/symbol should be displayed.
+
+**direction**stringrequired
+
+Either `ltr` for words that should be displayed left-to-right, or `rtl` vice versa.
+
+Possible values: \[`ltr`, `rtl`]
+
+**speaker**string
+
+Label indicating who said that word. Only set if [diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) is enabled.
+
+**tags**string\[]
+
+This is a set list of profanities and disfluencies respectively that cannot be altered by the end user. `[disfluency]` is only present in English, and `[profanity]` is present in English, Spanish, and Italian
+
+Possible values: \[`disfluency`, `profanity`]
+
+* ]
+
+**end\_time**floatrequired
+
+**start\_time**floatrequired
+
+**type**stringrequired
+
+Possible values: \[`word`, `punctuation`]
+
+* ]
+
+**written\_form** <!-- -->object\[]
+
+For 'entity' results only, the written\_form is a standardized form of the spoken words. It contains the formatted entity split into individual words.
+
+* Array \[
+
+**alternatives** <!-- -->object\[]required
+
+* Array \[
+
+**content**stringrequired
+
+A word or punctuation mark.
+
+**confidence**floatrequired
+
+A confidence score assigned to the alternative. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+**language**string
+
+The language that the alternative word is assumed to be spoken in. Currently, this will always be equal to the language that was requested in the initial `StartRecognition` message.
+
+**display** <!-- -->object
+
+Information about how the word/symbol should be displayed.
+
+**direction**stringrequired
+
+Either `ltr` for words that should be displayed left-to-right, or `rtl` vice versa.
+
+Possible values: \[`ltr`, `rtl`]
+
+**speaker**string
+
+Label indicating who said that word. Only set if [diarization](https://docs.speechmatics.com/speech-to-text/features/diarization) is enabled.
+
+**tags**string\[]
+
+This is a set list of profanities and disfluencies respectively that cannot be altered by the end user. `[disfluency]` is only present in English, and `[profanity]` is present in English, Spanish, and Italian
+
+Possible values: \[`disfluency`, `profanity`]
+
+* ]
+
+**end\_time**floatrequired
+
+**start\_time**floatrequired
+
+**type**stringrequired
+
+Possible values: \[`word`]
+
+* ]
+
+* ]
+
+**channel**string
+
+The channel identifier to which the audio belongs. This field is only seen in multichannel.
+
+### <!-- -->AddPartialTranslation[​](#addpartialtranslation "Direct link to addpartialtranslation")
+
+Contains a work-in-progress translation of a part of the audio that the client has sent.
+
+**message**required
+
+Constant value: `AddPartialTranslation`
+
+**format**string
+
+Speechmatics JSON output format version number.
+
+**Example:&#x20;**`2.1`
+
+**language**stringrequired
+
+Language translation relates to given as an ISO language code.
+
+**results** <!-- -->object\[]required
+
+* Array \[
+
+**content**stringrequired
+
+**start\_time**floatrequired
+
+The start time (in seconds) of the original transcribed audio segment
+
+**end\_time**floatrequired
+
+The end time (in seconds) of the original transcribed audio segment
+
+**speaker**string
+
+The speaker that uttered the speech if speaker diarization is enabled
+
+* ]
+
+### <!-- -->AddTranslation[​](#addtranslation "Direct link to addtranslation")
+
+Contains the final translation of a part of the audio that the client has sent.
+
+**message**required
+
+Constant value: `AddTranslation`
+
+**format**string
+
+Speechmatics JSON output format version number.
+
+**Example:&#x20;**`2.1`
+
+**language**stringrequired
+
+Language translation relates to given as an ISO language code.
+
+**results** <!-- -->object\[]required
+
+* Array \[
+
+**content**stringrequired
+
+**start\_time**floatrequired
+
+The start time (in seconds) of the original transcribed audio segment
+
+**end\_time**floatrequired
+
+The end time (in seconds) of the original transcribed audio segment
+
+**speaker**string
+
+The speaker that uttered the speech if speaker diarization is enabled
+
+* ]
+
+### <!-- -->EndOfTranscript[​](#endoftranscript "Direct link to endoftranscript")
+
+Server response to `EndOfStream`, after the server has finished sending all AddTranscript messages.
+
+**message**required
+
+Constant value: `EndOfTranscript`
+
+### <!-- -->AudioEventStarted[​](#audioeventstarted "Direct link to audioeventstarted")
+
+Start of an audio event detected.
+
+**message**required
+
+Constant value: `AudioEventStarted`
+
+**event** <!-- -->objectrequired
+
+**type**stringrequired
+
+The type of audio event that has started or ended. See our list of [supported Audio Event types](https://docs.speechmatics.com/speech-to-text/features/audio-events#supported-audio-events).
+
+**start\_time**floatrequired
+
+The time (in seconds) of the audio corresponding to the beginning of the audio event.
+
+**confidence**floatrequired
+
+A confidence score assigned to the audio event. Ranges from 0.0 (least confident) to 1.0 (most confident).
+
+Possible values: `>= 0` and `<= 1`
+
+**channel**string
+
+The channel identifier to which the audio belongs. This field is only seen in multichannel.
+
+### <!-- -->AudioEventEnded[​](#audioeventended "Direct link to audioeventended")
+
+End of an audio event detected.
+
+**message**required
+
+Constant value: `AudioEventEnded`
+
+**event** <!-- -->objectrequired
+
+**type**stringrequired
+
+The type of audio event that has started or ended. See our list of [supported Audio Event types](https://docs.speechmatics.com/speech-to-text/features/audio-events#supported-audio-events).
+
+**end\_time**floatrequired
+
+**channel**string
+
+The channel identifier to which the audio belongs. This field is only seen in multichannel.
+
+### <!-- -->EndOfUtterance[​](#endofutterance "Direct link to endofutterance")
+
+Indicates the end of an utterance, triggered by a configurable period of non-speech. The message is sent when no speech has been detected for a short period of time, configurable by the `end_of_utterance_silence_trigger` parameter in `conversation_config` (see [End Of Utterance](https://docs.speechmatics.com/speech-to-text/realtime/turn-detection#configuration)).
+
+Like punctuation, an `EndOfUtterance` has zero duration.
+
+**message**required
+
+Constant value: `EndOfUtterance`
+
+**metadata** <!-- -->objectrequired
+
+**start\_time**float
+
+The time (in seconds) that the end of utterance was detected.
+
+**end\_time**float
+
+The time (in seconds) that the end of utterance was detected.
+
+**channel**string
+
+The channel identifier to which the EndOfUtterance message belongs. This field is only seen in multichannel.
+
+### <!-- -->Info[​](#info "Direct link to info")
+
+Additional information sent from the server to the client.
+
+**message**required
+
+Constant value: `Info`
+
+**type**stringrequired
+
+The following are the possible info types:
+
+| Info Type                  | Description                                                                                                                                                             |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recognition_quality`      | Informs the client what particular quality-based model is used to handle the recognition. Sent to the client immediately after the WebSocket handshake is completed.    |
+| `concurrent_session_usage` | Informs the client of their quota for concurrent sessions and how much of it they are using. Sent to the client immediately after the WebSocket handshake is completed. |
+
+Possible values: \[`recognition_quality`, `concurrent_session_usage`]
+
+**reason**stringrequired
+
+**code**integer
+
+**seq\_no**integer
+
+**quality**string
+
+Only set when `type` is `recognition_quality`. Quality-based model name. It is one of "telephony", "broadcast". The model is selected automatically, for high-quality audio (12kHz+) the broadcast model is used, for lower quality audio the telephony model is used.
+
+**usage**number
+
+Only set when `type` is `concurrent_session_usage`. Indicates the current usage (number of active concurrent sessions).
+
+**quota**number
+
+Only set when `type` is `concurrent_session_usage`. Indicates the current quota (maximum number of concurrent sessions allowed).
+
+**last\_updated**string
+
+Only set when `type` is `concurrent_session_usage`. Indicates the timestamp of the most recent usage update, in the format `YYYY-MM-DDTHH:MM:SSZ` (UTC). This value is updated even when usage exceeds the quota, as it represents the most recent known data. In some cases, it may be empty or outdated due to internal errors preventing successful update.
+
+**Example:&#x20;**`2025-03-25T08:45:31Z`
+
+### <!-- -->Warning[​](#warning "Direct link to warning")
+
+Warning messages sent from the server to the client.
+
+**message**required
+
+Constant value: `Warning`
+
+**type**stringrequired
+
+The following are the possible warning types:
+
+| Warning Type                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `duration_limit_exceeded`       | The maximum allowed duration of a single utterance to process has been exceeded. Any `AddAudio` messages received that exceed this limit are confirmed with `AudioAdded`, but are ignored by the transcription engine. Exceeding the limit triggers the same mechanism as receiving an `EndOfStream` message, so the Server will eventually send an `EndOfTranscript` message and suspend.                                                                                                                                                       |
+| `unsupported_translation_pair`  | One of the requested translation target languages is unsupported (given the source audio language). The error message specifies the unsupported language pair.                                                                                                                                                                                                                                                                                                                                                                                   |
+| `idle_timeout`                  | Informs that the session is approaching the idle duration limit (no audio data sent within the last hour), with a `reason` of the form:`Session will timeout in {time_remaining}m due to inactivity, no audio sent within the last {time_elapsed}m`Currently the server will send messages at 15, 10 and 5m prior to timeout, and will send a final error message on timeout, before closing the connection with the code 1008. (see [Realtime limits](https://docs.speechmatics.com/speech-to-text/realtime/limits) for more information).      |
+| `session_timeout`               | Informs that the session is approaching the max session duration limit (maximum session duration of 48 hours), with a `reason` of the form:`Session will timeout in {time_remaining}m due to max duration, session has been active for {time_elapsed}m`Currently the server will send messages at 45, 30 and 15m prior to timeout, and will send a final error message on timeout, before closing the connection with the code 1008. (see [Realtime limits](https://docs.speechmatics.com/speech-to-text/realtime/limits) for more information). |
+| `empty_translation_target_list` | No supported translation target languages specified. Translation will not run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `add_audio_after_eos`           | Protocol specification doesn't allow adding audio after `EndOfStream` has been received. Any \`AddAudio messages after this, will be ignored.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `speaker_id`                    | Informs the client about any speaker ID related issues.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+
+Possible values: \[`duration_limit_exceeded`, `unsupported_translation_pair`, `idle_timeout`, `session_timeout`, `empty_translation_target_list`, `add_audio_after_eos`, `speaker_id`]
+
+**reason**stringrequired
+
+**code**integer
+
+**seq\_no**integer
+
+**duration\_limit**number
+
+Only set when `type` is `duration_limit_exceeded`. Indicates the limit that was exceeded (in seconds).
+
+### <!-- -->Error[​](#error "Direct link to error")
+
+Error messages sent from the server to the client. After any error, the transcription is terminated and the connection is closed.
+
+**message**required
+
+Constant value: `Error`
+
+**type**stringrequired
+
+The following are the possible error types:
+
+| Error Type              | Description                                                                                                                                                    |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_message`       | The message received was not understood.                                                                                                                       |
+| `invalid_model`         | Unable to use the model for the recognition. This can happen if the language is not supported at all, or is not available for the user.                        |
+| `invalid_language`      | The requested language is not valid or is not supported.                                                                                                       |
+| `invalid_config`        | The config received contains some wrong or unsupported fields, or too many translation target languages were requested.                                        |
+| `invalid_audio_type`    | Audio type is not supported, is deprecated, or the `audio_type` is malformed.                                                                                  |
+| `invalid_output_format` | Output format is not supported, is deprecated, or the `output_format` is malformed.                                                                            |
+| `not_authorised`        | User was not recognised, or the API key provided is not valid.                                                                                                 |
+| `not_allowed`           | User is not allowed to use this message (is not allowed to perform the action the message would invoke).                                                       |
+| `job_error`             | Unable to do any work on this job, the server might have timed out etc.                                                                                        |
+| `protocol_error`        | Message received was syntactically correct, but could not be accepted due to protocol limitations. This is usually caused by messages sent in the wrong order. |
+| `quota_exceeded`        | Maximum number of concurrent connections allowed for the contract has been reached                                                                             |
+| `timelimit_exceeded`    | Usage quota for the contract has been reached                                                                                                                  |
+| `idle_timeout`          | Idle duration limit was reached (no audio data sent within the last hour), a closing handshake with code 1008 follows this in-band error.                      |
+| `session_timeout`       | Max session duration was reached (maximum session duration of 48 hours), a closing handshake with code 1008 follows this in-band error.                        |
+| `unknown_error`         | An error that did not fit any of the types above.                                                                                                              |
+
+`invalid_message`, `protocol_error` and `unknown_error` can be triggered as a response to any type of messages.
+
+Possible values: \[`invalid_message`, `invalid_model`, `invalid_language`, `invalid_config`, `invalid_audio_type`, `invalid_output_format`, `not_authorised`, `not_allowed`, `job_error`, `protocol_error`, `quota_exceeded`, `timelimit_exceeded`, `idle_timeout`, `session_timeout`, `unknown_error`]
+
+**reason**stringrequired
+
+**code**integer
+
+**seq\_no**integer
+
+### <!-- -->SpeakersResult[​](#speakersresult "Direct link to speakersresult")
+
+Server response to GetSpeakers request returning any detected speaker identifiers.
+
+**message**required
+
+Constant value: `SpeakersResult`
+
+**speakers** <!-- -->object\[]required
+
+* Array \[
+
+**label**stringrequired
+
+Speaker label.
+
+Possible values: `non-empty`
+
+**speaker\_identifiers**bytes\[]required
+
+Possible values: `>= 1`
+
+* ]
+
+## Websocket errors[​](#websocket-errors "Direct link to Websocket errors")
+
+In the Realtime SaaS, an in-band error message can be followed by a WebSocket close message. The table below shows the possible WebSocket close codes and associated error types. The error types are provided in the payload of the close message.
+
+| WebSocket Close Code | WebSocket Close Payload |
+| -------------------- | ----------------------- |
+| 1003                 | `protocol_error`        |
+| 1008                 | `policy_violation`      |
+| 1011                 | `internal_error`        |
+| 4001                 | `not_authorised`        |
+| 4003                 | `not_allowed`           |
+| 4004                 | `invalid_model`         |
+| 4005                 | `quota_exceeded`        |
+| 4006                 | `timelimit_exceeded`    |
+| 4013                 | `job_error`             |
+---
+# Create a new job
+
+```
+POST 
+/jobs
+```
+
+Create a new job
+
+## Request[​](#request "Direct link to Request")
+
+## Responses[​](#responses "Direct link to Responses")
+
+* 201
+* 400
+* 401
+* 403
+* 410
+* 429
+* 500
+
+OK
+
+Bad request
+
+Unauthorized
+
+Forbidden
+
+Gone
+
+Rate Limited
+
+Internal Server Error
+---
+# Delete a job
+
+```
+DELETE 
+/jobs/:jobid
+```
+
+Delete a job and remove all associated resources.
+
+## Request[​](#request "Direct link to Request")
+
+## Responses[​](#responses "Direct link to Responses")
+
+* 200
+* 401
+* 404
+* 410
+* 423
+* 429
+* 500
+
+The job that was deleted.
+
+Unauthorized
+
+Not found
+
+Gone
+
+Locked
+
+Rate Limited
+
+Internal Server Error
+---
+# Get job details
+
+```
+GET 
+/jobs/:jobid
+```
+
+Get job details, including progress and any error reports.
+
+## Request[​](#request "Direct link to Request")
+
+## Responses[​](#responses "Direct link to Responses")
+
+* 200
+* 401
+* 404
+* 410
+* 429
+* 500
+
+OK
+
+Unauthorized
+
+Not found
+
+Gone
+
+Rate Limited
+
+Internal Server Error
+---
+# Get the transcript for a transcription job
+
+```
+GET 
+/jobs/:jobid/transcript
+```
+
+Get the transcript for a transcription job
+
+## Request[​](#request "Direct link to Request")
+
+## Responses[​](#responses "Direct link to Responses")
+
+* 200
+* 401
+* 404
+* 410
+* 429
+* 500
+
+OK
+
+Unauthorized
+
+Not found
+
+Gone
+
+Rate Limited
+
+Internal Server Error
+---
+# Get usage statistics
+
+```
+GET 
+/usage
+```
+
+Get usage statistics
+
+## Request[​](#request "Direct link to Request")
+
+## Responses[​](#responses "Direct link to Responses")
+
+* 200
+* 401
+* 403
+* 429
+* 500
+
+OK
+
+Unauthorized
+
+Forbidden
+
+Rate Limited
+
+Internal Server Error
+---

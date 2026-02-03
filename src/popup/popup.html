@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speechmatics Transcription</title>
+    <style>
+        :root {
+            --bg: #f9fafb;
+            --card: #ffffff;
+            --text: #111827;
+            --muted: #6b7280;
+            --border: #e5e7eb;
+            --brand: #00a2c7;
+            --success: #4CAF50;
+            --error: #ff4444;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 12px;
+            width: 340px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: "DM Sans", "Manrope", "Segoe UI", sans-serif;
+        }
+
+        h1 {
+            margin: 0 0 12px;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        h2 {
+            margin: 10px 0 8px 0;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
+            box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+            margin-bottom: 12px;
+        }
+
+        .card:last-child {
+            margin-bottom: 0;
+        }
+
+        .row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .row:last-child {
+            margin-bottom: 0;
+        }
+
+        button {
+            border: none;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #ffffff;
+            background: var(--brand);
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0, 162, 199, 0.2);
+            transition: all 0.2s;
+        }
+
+        button:hover:not(:disabled) {
+            background: #0088a3;
+            box-shadow: 0 6px 16px rgba(0, 162, 199, 0.3);
+        }
+
+        button.danger {
+            background: var(--error);
+            box-shadow: 0 4px 12px rgba(255, 68, 68, 0.2);
+        }
+
+        button.danger:hover:not(:disabled) {
+            background: #cc0000;
+        }
+
+        button.full {
+            width: 100%;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        label {
+            font-size: 12px;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+        }
+
+        input[type="text"],
+        input[type="password"],
+        input[type="number"],
+        select {
+            width: 100%;
+            margin-top: 6px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-size: 12px;
+            font-family: inherit;
+        }
+
+        input[type="checkbox"],
+        input[type="radio"] {
+            cursor: pointer;
+            margin: 0;
+        }
+
+        .hint {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 4px;
+        }
+
+        .status {
+            font-size: 11px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            margin-top: 6px;
+            display: none;
+        }
+
+        .status.success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            display: block;
+        }
+
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+            display: block;
+        }
+
+        .api-key-group {
+            position: relative;
+        }
+
+        .toggle-visibility {
+            position: absolute;
+            right: 10px;
+            top: 28px;
+            background: none;
+            border: none;
+            color: var(--muted);
+            cursor: pointer;
+            padding: 0;
+            font-size: 12px;
+            box-shadow: none;
+        }
+
+        .toggle-visibility:hover {
+            color: var(--text);
+        }
+
+        .button-group {
+            display: flex;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .button-group button {
+            flex: 1;
+        }
+
+        .mode-options {
+            display: flex;
+            gap: 12px;
+            margin-top: 8px;
+        }
+
+        .mode-option {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex: 1;
+        }
+
+        .mode-option input {
+            margin: 0;
+        }
+
+        .mode-option label {
+            margin: 0;
+            flex: 1;
+        }
+
+        .info-box {
+            background: #f0f9ff;
+            border: 1px solid #bae6fd;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--text);
+        }
+
+        .info-box h3 {
+            margin: 0 0 6px 0;
+            color: #0369a1;
+            font-size: 12px;
+        }
+
+        .info-box p {
+            margin: 4px 0;
+        }
+
+        a {
+            color: var(--brand);
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    
+    <h1>Speechmatics Transcription</h1>
+
+    <!-- API Key Section -->
+    <div class="card">
+        <h2>API Key</h2>
+        <div class="api-key-group">
+            <label for="api-key">Speechmatics API Key</label>
+            <input type="password" id="api-key" placeholder="Enter your API key" />
+            <button class="toggle-visibility" id="toggle-api-key" type="button">Show</button>
+        </div>
+        <div id="api-status" class="status"></div>
+        <div class="button-group">
+            <button id="save-api-key" class="full">Save Key</button>
+            <button id="delete-api-key" class="danger">Delete</button>
+        </div>
+        <div class="hint">Get your API key from <a href="https://portal.speechmatics.com/settings/api-keys" target="_blank">Speechmatics Console</a></div>
+    </div>
+
+    <!-- Transcription Mode Section -->
+    <div class="card">
+        <h2>Transcription Mode</h2>
+        <div class="mode-options">
+            <div class="mode-option">
+                <input type="radio" id="mode-timer" name="transcription-mode" value="timer" />
+                <label for="mode-timer">Timer</label>
+            </div>
+            <div class="mode-option">
+                <input type="radio" id="mode-manual" name="transcription-mode" value="manual" />
+                <label for="mode-manual">Manual</label>
+            </div>
+        </div>
+        <div class="hint">Timer: Auto-submit after silence. Manual: You decide when to submit.</div>
+    </div>
+
+    <!-- Timer Settings -->
+    <div class="card" id="timer-settings">
+        <h2>Auto-Submit Delay</h2>
+        <label for="auto-submit-delay">
+            Delay after last speech (seconds)
+            <input type="number" id="auto-submit-delay" min="0" max="10" step="0.5" value="0.5" />
+        </label>
+        <div class="hint">Time to wait after last detected speech before auto-submitting. Set to 0 for immediate submit.</div>
+    </div>
+
+    <!-- General Settings -->
+    <div class="card">
+        <h2>Text Settings</h2>
+        
+        <div class="row">
+            <label for="append-mode">
+                <input type="checkbox" id="append-mode" />
+                Append to prompt
+            </label>
+        </div>
+
+        <div class="row">
+            <label for="auto-enter">
+                <input type="checkbox" id="auto-enter" />
+                Auto-press Enter after submit
+            </label>
+        </div>
+
+        <div class="row">
+            <label for="auto-submit-message">
+                <input type="checkbox" id="auto-submit-message" />
+                Auto-send message to ChatGPT
+            </label>
+        </div>
+
+        <div class="row">
+            <label for="show-partial-transcript">
+                <input type="checkbox" id="show-partial-transcript" />
+                Show live partial transcription
+            </label>
+        </div>
+
+        <div class="row">
+            <label for="debug-mode">
+                <input type="checkbox" id="debug-mode" />
+                Debug logging
+            </label>
+        </div>
+    </div>
+
+    <!-- Info Section -->
+    <div class="card">
+        <div class="info-box">
+            <h3>⌨️ Keyboard Shortcuts</h3>
+            <p><strong>Spacebar:</strong> Hold to record, release to submit</p>
+            <p><strong>Escape:</strong> Delete last transcribed text</p>
+            <p class="hint">Tip: Spacebar push-to-talk works only when the ChatGPT prompt is not focused.</p>
+        </div>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>
