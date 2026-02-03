@@ -35,6 +35,7 @@ const SpeechmasticsTranscriber = (() => {
         autoSubmitMessage: false,
         showPartialTranscript: true,
         debug: false,
+        preferredAudioInputDeviceId: null,
     };
 
     // Legacy key (older versions stored apiKey in sync).
@@ -50,6 +51,7 @@ const SpeechmasticsTranscriber = (() => {
     let currentTranscript = "";
     let currentPartial = "";
     let mediaStream = null;
+    let activeAudioDeviceId = null;
     let audioContext = null;
     let audioSource = null;
     let audioProcessor = null; // ScriptProcessorNode
@@ -118,14 +120,55 @@ const SpeechmasticsTranscriber = (() => {
     // Initialize audio context and get microphone access
     async function initializeAudio() {
         try {
+            const preferred =
+                typeof settings.preferredAudioInputDeviceId === "string" &&
+                settings.preferredAudioInputDeviceId.trim()
+                    ? settings.preferredAudioInputDeviceId.trim()
+                    : null;
+
+            // If we already have a stream but it doesn't match the preferred device, drop it.
+            if (mediaStream) {
+                try {
+                    const track = mediaStream.getAudioTracks?.()[0] || null;
+                    const currentId = track?.getSettings?.().deviceId || null;
+                    if (preferred && currentId && currentId !== preferred) {
+                        stopMediaStream();
+                    }
+                } catch {
+                    // ignore
+                }
+            }
+
             if (!mediaStream) {
-                mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                    },
-                });
+                const baseAudio = {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                };
+
+                const constraints = preferred
+                    ? { audio: { ...baseAudio, deviceId: { exact: preferred } } }
+                    : { audio: baseAudio };
+
+                try {
+                    mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                } catch (err) {
+                    // If the preferred device isn't available, fall back to default.
+                    const name = err?.name || "";
+                    if (preferred && (name === "OverconstrainedError" || name === "NotFoundError")) {
+                        notifyError("Selected microphone not available. Using default.", "error");
+                        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+                    } else {
+                        throw err;
+                    }
+                }
+
+                try {
+                    const track = mediaStream.getAudioTracks?.()[0] || null;
+                    activeAudioDeviceId = track?.getSettings?.().deviceId || null;
+                } catch {
+                    activeAudioDeviceId = null;
+                }
             }
 
             if (!audioContext) {
@@ -142,6 +185,93 @@ const SpeechmasticsTranscriber = (() => {
             return false;
         }
     }
+
+    function stopMediaStream() {
+        if (!mediaStream) return;
+        try {
+            mediaStream.getTracks?.().forEach((t) => {
+                try {
+                    t.stop();
+                } catch {
+                    // ignore
+                }
+            });
+        } catch {
+            // ignore
+        }
+        mediaStream = null;
+        activeAudioDeviceId = null;
+    }
+
+    async function listAudioInputs() {
+        if (!navigator.mediaDevices?.enumerateDevices) {
+            return { ok: false, error: "ENUMERATE_UNSUPPORTED" };
+        }
+
+        // enumerateDevices returns labels only if mic permission was granted on the page.
+        const all = await navigator.mediaDevices.enumerateDevices();
+        const inputs = all.filter((d) => d.kind === "audioinput");
+
+        const devices = inputs.map((d, idx) => ({
+            deviceId: d.deviceId,
+            label: d.label || `Microphone ${idx + 1}`,
+        }));
+
+        const selected =
+            typeof settings.preferredAudioInputDeviceId === "string"
+                ? settings.preferredAudioInputDeviceId
+                : null;
+
+        return { ok: true, devices, selectedDeviceId: selected || "" };
+    }
+
+    function applyPreferredAudioInputDeviceId(deviceIdOrNull) {
+        const id =
+            typeof deviceIdOrNull === "string" && deviceIdOrNull.trim()
+                ? deviceIdOrNull.trim()
+                : null;
+        settings.preferredAudioInputDeviceId = id;
+
+        // Only apply immediately when not recording (to avoid disrupting transcription).
+        if (isRecording) {
+            return { ok: false, error: "RECORDING_ACTIVE" };
+        }
+
+        // Drop the stream so the next start uses the new device.
+        stopMediaStream();
+        return { ok: true };
+    }
+
+    // Allow the popup to list/set microphones via the ChatGPT tab.
+    chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+        if (!request?.type) return;
+
+        if (request.type === "wispersend:listAudioInputs") {
+            (async () => {
+                try {
+                    await loadSettings();
+                    const resp = await listAudioInputs();
+                    sendResponse(resp);
+                } catch (err) {
+                    sendResponse({ ok: false, error: "LIST_FAILED", message: err?.message || String(err) });
+                }
+            })();
+            return true;
+        }
+
+        if (request.type === "wispersend:setAudioInput") {
+            const deviceId = request.deviceId || null;
+            const result = applyPreferredAudioInputDeviceId(deviceId);
+            // Best-effort persist (popup also persists, but this keeps the tab consistent).
+            try {
+                chrome.storage.sync.set({ preferredAudioInputDeviceId: result.ok ? (settings.preferredAudioInputDeviceId || null) : (deviceId || null) });
+            } catch {
+                // ignore
+            }
+            sendResponse(result);
+            return;
+        }
+    });
 
     function nowMs() {
         return Date.now();
@@ -170,7 +300,7 @@ const SpeechmasticsTranscriber = (() => {
             }
 
             const details = status ? ` (HTTP ${status})` : "";
-            throw new Error(`Failed to obtain Speechmatics temp key${details}`);
+            throw new Error(`Failed to obtain session token${details}`);
         }
 
         cachedTempKey = resp.tempKey;
@@ -227,12 +357,12 @@ const SpeechmasticsTranscriber = (() => {
             log("Connection error:", error);
             if (error.message.includes("API key")) {
                 notifyError("API key not configured. Please set it in settings.", "error");
-            } else if (error.message.includes("Failed to obtain Speechmatics temp key")) {
+            } else if (error.message.includes("Failed to obtain session token")) {
                 notifyError(error.message, "error");
             } else if (error.message.includes("timeout")) {
                 notifyError("Connection timeout. Please try again.", "timeout");
             } else {
-                notifyError("Failed to connect to Speechmatics. Please try again.", "connection");
+                notifyError("Failed to connect to the transcription service. Please try again.", "connection");
             }
             throw error;
         }

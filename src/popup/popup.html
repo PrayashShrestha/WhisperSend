@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Speechmatics Transcription</title>
+    <title>WisperSend</title>
     <style>
         :root {
             --bg: #f9fafb;
@@ -30,11 +30,31 @@
         }
 
         h1 {
-            margin: 0 0 12px;
+            margin: 0;
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--text);
+            letter-spacing: 0.02em;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 2px 0 12px;
+        }
+
+        .brand img {
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+        }
+
+        .brand .subtitle {
             font-size: 12px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
             color: var(--muted);
+            margin-top: 2px;
         }
 
         h2 {
@@ -244,14 +264,19 @@
     </style>
 </head>
 <body>
-    
-    <h1>Speechmatics Transcription</h1>
+    <div class="brand">
+        <img src="../../images/icon.png" alt="WisperSend icon" />
+        <div>
+            <h1>WisperSend</h1>
+            <div class="subtitle">Voice dictation for ChatGPT</div>
+        </div>
+    </div>
 
     <!-- API Key Section -->
     <div class="card">
         <h2>API Key</h2>
         <div class="api-key-group">
-            <label for="api-key">Speechmatics API Key</label>
+            <label for="api-key">Transcription API Key</label>
             <input type="password" id="api-key" placeholder="Enter your API key" />
             <button class="toggle-visibility" id="toggle-api-key" type="button">Show</button>
         </div>
@@ -260,7 +285,24 @@
             <button id="save-api-key" class="full">Save Key</button>
             <button id="delete-api-key" class="danger">Delete</button>
         </div>
-        <div class="hint">Get your API key from <a href="https://portal.speechmatics.com/settings/api-keys" target="_blank">Speechmatics Console</a></div>
+        <div class="hint">Get your API key from <a href="https://portal.speechmatics.com/settings/api-keys" target="_blank">your account portal</a></div>
+    </div>
+
+    <!-- Microphone Selection -->
+    <div class="card">
+        <h2>Microphone</h2>
+        <label for="mic-device">
+            Input device
+            <select id="mic-device">
+                <option value="">Default</option>
+            </select>
+        </label>
+        <div class="button-group">
+            <button id="refresh-mics" type="button">Refresh</button>
+            <button id="apply-mic" type="button">Apply</button>
+        </div>
+        <div id="mic-status" class="status"></div>
+        <div class="hint">Tip: open ChatGPT and allow microphone access to see device names.</div>
     </div>
 
     <!-- Transcription Mode Section -->
@@ -329,13 +371,27 @@
         </div>
     </div>
 
+    <!-- Prompt Checklist -->
+    <div class="card">
+        <h2>Prompt Checklist</h2>
+        <div id="prompt-checklist"></div>
+        <label for="prompt-new">
+            Add new item
+            <input type="text" id="prompt-new" placeholder="e.g. Give a short and crisp answer" />
+        </label>
+        <div class="button-group">
+            <button id="prompt-add" type="button">Add</button>
+            <button id="prompt-clear" class="danger" type="button">Clear All</button>
+        </div>
+        <div class="hint">Checked items stay at the top of the ChatGPT prompt; your voice text appends after.</div>
+    </div>
+
     <!-- Info Section -->
     <div class="card">
         <div class="info-box">
             <h3>⌨️ Keyboard Shortcuts</h3>
             <p><strong>Spacebar:</strong> Hold to record, release to submit</p>
-            <p><strong>Escape:</strong> Delete last transcribed text</p>
-            <p class="hint">Tip: Spacebar push-to-talk works only when the ChatGPT prompt is not focused.</p>
+            <p><strong>Escape:</strong> Clear prompt + reset session</p>
         </div>
     </div>
 

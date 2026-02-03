@@ -1,16 +1,23 @@
 {
   "manifest_version": 3,
-  "name": "Test Ext",
-  "description": "This a test ext",
+  "name": "WisperSend",
+  "description": "Real-time voice dictation for ChatGPT—hold to talk, get instant transcripts, and send hands-free.",
   "version": "1.0",
   "incognito": "spanning",
   "action": {
-    "default_popup": "src/popup/popup.html"
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "images/icon-16.png",
+      "32": "images/icon-32.png",
+      "48": "images/icon.png",
+      "128": "images/icon.png"
+    }
   },
   "icons": {
     "16": "images/icon-16.png",
     "32": "images/icon-32.png",
-    "128": "images/icon-128.png"
+    "48": "images/icon.png",
+    "128": "images/icon.png"
   },
   "background": {
     "service_worker": "src/background.js",
