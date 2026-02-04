@@ -103,6 +103,8 @@
     let cachedFinalBase = "";
     let cachedFinalSpeech = "";
     let cachedFinalMode = null;
+    let lastPromptTextFast = "";
+    let lastPromptTextFastEl = null;
 
     function isEditActive() {
         return editState !== EditState.IDLE;
@@ -920,13 +922,25 @@
      */
     function setPromptTextFast(promptEl, text) {
         if (!promptEl) return;
-        if (promptEl.tagName === "TEXTAREA" || promptEl.tagName === "INPUT") {
-            promptEl.value = text;
-            promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+        const isTextInput = promptEl.tagName === "TEXTAREA" || promptEl.tagName === "INPUT";
+        const currentValue = isTextInput ? (promptEl.value || "") : (promptEl.innerText || "");
+
+        if (
+            lastPromptTextFastEl === promptEl &&
+            lastPromptTextFast === text &&
+            currentValue === text
+        ) {
             return;
         }
-        promptEl.innerText = text;
+
+        if (isTextInput) {
+            promptEl.value = text;
+        } else {
+            promptEl.innerText = text;
+        }
         promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+        lastPromptTextFast = text;
+        lastPromptTextFastEl = promptEl;
     }
 
     function shouldPreserveSelection(promptEl) {
@@ -1064,6 +1078,8 @@
         if (promptEl.tagName === "TEXTAREA" || promptEl.tagName === "INPUT") {
             promptEl.value = text;
             promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+            lastPromptTextFast = text;
+            lastPromptTextFastEl = promptEl;
 
             if (selection) {
                 restoreSelection(promptEl, selection);
@@ -1083,6 +1099,8 @@
 
         promptEl.innerText = text;
         promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+        lastPromptTextFast = text;
+        lastPromptTextFastEl = promptEl;
         if (selection) {
             restoreSelection(promptEl, selection);
         }

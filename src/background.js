@@ -25,6 +25,10 @@ const SETTINGS_DEFAULTS = {
     editDebounceMs: 350,
     speechmaticsRegion: "us",
     latencyMode: "fast",
+    maxDelaySeconds: 0.7,
+    lowLatencyAudio: true,
+    hotStandbyMs: 15000,
+    prebufferMs: 1500,
 };
 
 let settingsCache = { ...SETTINGS_DEFAULTS };

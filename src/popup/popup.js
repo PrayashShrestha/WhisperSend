@@ -58,6 +58,10 @@ const SETTINGS_DEFAULTS = {
     editDebounceMs: 350,
     speechmaticsRegion: "us",
     latencyMode: "fast",
+    maxDelaySeconds: 0.7,
+    lowLatencyAudio: true,
+    hotStandbyMs: 15000,
+    prebufferMs: 1500,
     promptChecklist: [
         { id: "prompt", text: "Make sure to have this in your response", checked: false },
         { id: "professional", text: "Respond the answer in a professional way", checked: false },

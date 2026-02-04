@@ -23,10 +23,11 @@ const SpeechmasticsTranscriber = (() => {
         eu: "wss://eu.rt.speechmatics.com/v2",
     };
     const TARGET_SAMPLE_RATE = 16000;
-    const AUDIO_CHUNK_FAST = 512;
+    const AUDIO_CHUNK_FAST = 256;
     const AUDIO_CHUNK_ACCURATE = 1024;
     const OPERATING_POINT_FAST = "standard";
     const OPERATING_POINT_ACCURATE = "enhanced";
+    const FINAL_DRAIN_TIMEOUT_MS = 1200;
     let sessionId = 0;
     // Guards against late WebSocket events from a previous connection instance.
     // Each (re)connect increments the epoch; message handlers ignore stale epochs.
@@ -45,6 +46,10 @@ const SpeechmasticsTranscriber = (() => {
         preferredAudioInputDeviceId: null,
         speechmaticsRegion: "us",
         latencyMode: "fast", // "fast" | "accurate"
+        maxDelaySeconds: 0.7,
+        lowLatencyAudio: true,
+        hotStandbyMs: 15000,
+        prebufferMs: 1500,
     };
 
     // Legacy key (older versions stored apiKey in sync).
@@ -56,6 +61,7 @@ const SpeechmasticsTranscriber = (() => {
     let settingsLoadPromise = null;
     let ws = null;
     let isRecording = false;
+    let isConnecting = false;
     // Accumulates *finalized* transcript chunks (AddTranscript).
     // We stream these to the ChatGPT UI as they arrive so the textbox doesn't "rewind"
     // when partial hypotheses change.
@@ -71,9 +77,13 @@ const SpeechmasticsTranscriber = (() => {
     let audioTrackReader = null;
     let audioTrackReadAbort = false;
     let muteGain = null;
+    let audioProcessingPaused = false;
+    let standbyTimer = null;
     let lastSpeechTime = 0;
+    let lastFinalTranscriptAt = 0;
     let silenceTimeout = null;
     let lastSeqNo = -1;
+    let pendingDrainResolve = null;
     // Speechmatics' schema expectations can vary by endpoint/version.
     // We keep multiple payload variants and retry within a session.
     // 0 = minimal { encoding, sample_rate }
@@ -86,6 +96,10 @@ const SpeechmasticsTranscriber = (() => {
     let spacebarPushToTalkActive = false;
     let authRegionFallbackAttempted = false;
 
+    let pendingAudioQueue = [];
+    let pendingAudioBytes = 0;
+    let pendingAudioMaxBytes = 0;
+
     // Temporary key caching (browser WS can't set Authorization headers).
     let cachedTempKey = null;
     let cachedTempKeyExpiresAt = 0;
@@ -97,6 +111,85 @@ const SpeechmasticsTranscriber = (() => {
     function log(...args) {
         if (settings.debug) {
             console.log("[SpeechmasticsTranscriber]", ...args);
+        }
+    }
+
+    function updatePrebufferLimit() {
+        const ms = Number(settings.prebufferMs);
+        const safeMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+        pendingAudioMaxBytes = Math.max(
+            0,
+            Math.round((TARGET_SAMPLE_RATE * 2 * safeMs) / 1000)
+        );
+        trimPendingAudioQueue();
+    }
+
+    function trimPendingAudioQueue() {
+        if (pendingAudioMaxBytes <= 0) {
+            pendingAudioQueue = [];
+            pendingAudioBytes = 0;
+            return;
+        }
+        while (pendingAudioBytes > pendingAudioMaxBytes && pendingAudioQueue.length) {
+            const dropped = pendingAudioQueue.shift();
+            if (dropped?.byteLength) {
+                pendingAudioBytes -= dropped.byteLength;
+            }
+        }
+    }
+
+    function queuePendingAudio(buffer) {
+        if (!buffer || !(buffer instanceof ArrayBuffer)) return;
+        if (pendingAudioMaxBytes <= 0) return;
+
+        if (buffer.byteLength > pendingAudioMaxBytes) {
+            pendingAudioQueue = [buffer];
+            pendingAudioBytes = buffer.byteLength;
+            return;
+        }
+
+        while (
+            pendingAudioQueue.length &&
+            pendingAudioBytes + buffer.byteLength > pendingAudioMaxBytes
+        ) {
+            const dropped = pendingAudioQueue.shift();
+            if (dropped?.byteLength) {
+                pendingAudioBytes -= dropped.byteLength;
+            }
+        }
+
+        pendingAudioQueue.push(buffer);
+        pendingAudioBytes += buffer.byteLength;
+    }
+
+    function flushPendingAudio() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!pendingAudioQueue.length) return;
+        for (const buffer of pendingAudioQueue) {
+            try {
+                ws.send(buffer);
+            } catch (error) {
+                log("Error flushing audio buffer:", error);
+                break;
+            }
+        }
+        pendingAudioQueue = [];
+        pendingAudioBytes = 0;
+    }
+
+    function clearPendingAudio() {
+        pendingAudioQueue = [];
+        pendingAudioBytes = 0;
+    }
+
+    function resolveDrainWaiter() {
+        if (pendingDrainResolve) {
+            try {
+                pendingDrainResolve();
+            } catch {
+                // ignore
+            }
+            pendingDrainResolve = null;
         }
     }
 
@@ -156,6 +249,7 @@ const SpeechmasticsTranscriber = (() => {
                         base.apiKey = apiKey;
 
                         settings = base;
+                        updatePrebufferLimit();
                         settingsLoaded = true;
                         log("Settings loaded:", settings);
                         resolve(settings);
@@ -181,6 +275,12 @@ const SpeechmasticsTranscriber = (() => {
                 const next = changes[key]?.newValue;
                 if (key in SETTINGS_DEFAULTS) {
                     settings[key] = next;
+                }
+                if (key === "prebufferMs") {
+                    updatePrebufferLimit();
+                }
+                if (key === "lowLatencyAudio" && !isRecording) {
+                    stopMediaStream();
                 }
                 if (key === "speechmaticsApiKey" || key === "apiKey") {
                     // Token must be refreshed for a new key.
@@ -214,10 +314,13 @@ const SpeechmasticsTranscriber = (() => {
             }
 
             if (!mediaStream) {
+                const useLowLatencyAudio = settings.lowLatencyAudio !== false;
                 const baseAudio = {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
+                    echoCancellation: !useLowLatencyAudio,
+                    noiseSuppression: !useLowLatencyAudio,
+                    autoGainControl: !useLowLatencyAudio,
+                    channelCount: 1,
+                    sampleRate: TARGET_SAMPLE_RATE,
                 };
 
                 const constraints = preferred
@@ -232,6 +335,15 @@ const SpeechmasticsTranscriber = (() => {
                     if (preferred && (name === "OverconstrainedError" || name === "NotFoundError")) {
                         notifyError("Selected microphone not available. Using default.", "error");
                         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+                    } else if (name === "OverconstrainedError") {
+                        // Retry with relaxed constraints (drop sampleRate/channelCount).
+                        mediaStream = await navigator.mediaDevices.getUserMedia({
+                            audio: {
+                                echoCancellation: baseAudio.echoCancellation,
+                                noiseSuppression: baseAudio.noiseSuppression,
+                                autoGainControl: baseAudio.autoGainControl,
+                            },
+                        });
                     } else {
                         throw err;
                     }
@@ -431,6 +543,7 @@ const SpeechmasticsTranscriber = (() => {
                     notifyConnectionStatus("connected");
                     lastSeqNo = -1;
                     sendStartRecognition();
+                    flushPendingAudio();
                     resolve();
                 };
 
@@ -442,6 +555,7 @@ const SpeechmasticsTranscriber = (() => {
                 ws.onerror = (error) => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket error:", error);
+                    resolveDrainWaiter();
                     if (!suppressErrors) {
                         notifyConnectionStatus("error");
                         notifyError("Transcription service error. Please try again.", "connection");
@@ -452,6 +566,7 @@ const SpeechmasticsTranscriber = (() => {
                 ws.onclose = () => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket closed");
+                    resolveDrainWaiter();
                     if (!suppressErrors) {
                         notifyConnectionStatus("error");
                     }
@@ -534,6 +649,11 @@ const SpeechmasticsTranscriber = (() => {
                 // Speechmatics currently supports: "standard" | "enhanced"
                 operating_point: getOperatingPoint(),
                 enable_partials: true,
+                max_delay: (() => {
+                    const raw = Number(settings.maxDelaySeconds);
+                    if (!Number.isFinite(raw) || raw <= 0) return undefined;
+                    return Math.min(Math.max(raw, 0.7), 2.0);
+                })(),
             },
         };
     }
@@ -649,6 +769,7 @@ const SpeechmasticsTranscriber = (() => {
             } else if (message.message === "Error") {
                 log("Server error:", message.reason);
                 const reason = message.reason || "Unknown error";
+                resolveDrainWaiter();
                 if (String(reason).toLowerCase().includes("not authorized")) {
                     retryWithAlternateRegionOnAuthError(reason);
                 } else if (
@@ -664,6 +785,8 @@ const SpeechmasticsTranscriber = (() => {
                 handleEndOfUtterance();
             } else if (message.message === "RecognitionStarted") {
                 log("Recognition started");
+            } else if (message.message === "EndOfTranscript") {
+                resolveDrainWaiter();
             }
         } catch (error) {
             log("Message parsing error:", error);
@@ -758,6 +881,7 @@ const SpeechmasticsTranscriber = (() => {
             currentTranscript += transcript;
             currentPartial = "";
             lastSpeechTime = Date.now();
+            lastFinalTranscriptAt = lastSpeechTime;
             log("Final text received:", transcript.trim());
 
             // Commit finalized words into the ChatGPT textbox immediately so that later partials
@@ -829,13 +953,8 @@ const SpeechmasticsTranscriber = (() => {
     }
 
     function sendPcmChunk(int16Array) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         if (!int16Array || int16Array.length === 0) return;
-        try {
-            ws.send(int16Array.buffer);
-        } catch (error) {
-            log("Error sending audio:", error);
-        }
+        sendOrQueuePcmBuffer(int16Array.buffer);
     }
 
     let audioWorkletLoadPromise = null;
@@ -868,6 +987,23 @@ class Pcm16DownsamplerProcessor extends AudioWorkletProcessor {
         this._write = 0;
         this._read = 0;
         this._available = 0;
+        this._paused = false;
+
+        this.port.onmessage = (event) => {
+            const data = event?.data || {};
+            if (data.type === "setPaused") {
+                this._paused = Boolean(data.paused);
+                if (this._paused) {
+                    this._write = 0;
+                    this._read = 0;
+                    this._available = 0;
+                }
+            } else if (data.type === "reset") {
+                this._write = 0;
+                this._read = 0;
+                this._available = 0;
+            }
+        };
     }
 
     _push(input) {
@@ -935,6 +1071,10 @@ class Pcm16DownsamplerProcessor extends AudioWorkletProcessor {
         // Keep the node "active" by passing audio through (it will be muted by GainNode in main thread).
         if (input && output) {
             output.set(input);
+        }
+
+        if (this._paused) {
+            return true;
         }
 
         if (!input || input.length === 0) {
@@ -1075,12 +1215,38 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
     }
 
     function sendPcmBuffer(buffer) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         if (!buffer || !(buffer instanceof ArrayBuffer) || buffer.byteLength === 0) return;
-        try {
-            ws.send(buffer);
-        } catch (error) {
-            log("Error sending audio buffer:", error);
+        sendOrQueuePcmBuffer(buffer);
+    }
+
+    function sendOrQueuePcmBuffer(buffer) {
+        if (!buffer || !(buffer instanceof ArrayBuffer)) return;
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                ws.send(buffer);
+                return;
+            } catch (error) {
+                log("Error sending audio buffer:", error);
+            }
+        }
+
+        if (isRecording || isConnecting) {
+            queuePendingAudio(buffer);
+        }
+    }
+
+    function setAudioProcessingPaused(paused) {
+        audioProcessingPaused = Boolean(paused);
+        if (audioWorkletNode && audioWorkletNode.port) {
+            try {
+                audioWorkletNode.port.postMessage({
+                    type: "setPaused",
+                    paused: audioProcessingPaused,
+                });
+            } catch {
+                // ignore
+            }
         }
     }
 
@@ -1106,7 +1272,7 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                         if (!frame) continue;
                         value = frame;
 
-                        if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) {
+                        if (audioProcessingPaused || (!isRecording && !isConnecting)) {
                             value.close();
                             continue;
                         }
@@ -1204,8 +1370,8 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                 });
 
                 audioWorkletNode.port.onmessage = (event) => {
-                    if (!isRecording) return;
-                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    if (audioProcessingPaused) return;
+                    if (!isRecording && !isConnecting) return;
                     const data = event?.data;
                     // The processor posts an ArrayBuffer as the message payload.
                     if (data instanceof ArrayBuffer) {
@@ -1214,6 +1380,14 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                         sendPcmBuffer(data.buffer);
                     }
                 };
+                try {
+                    audioWorkletNode.port.postMessage({
+                        type: "setPaused",
+                        paused: audioProcessingPaused,
+                    });
+                } catch {
+                    // ignore
+                }
 
                 audioSource.connect(audioWorkletNode);
                 audioWorkletNode.connect(muteGain);
@@ -1248,8 +1422,8 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                     });
 
                     audioWorkletNode.port.onmessage = (event) => {
-                        if (!isRecording) return;
-                        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                        if (audioProcessingPaused) return;
+                        if (!isRecording && !isConnecting) return;
                         const data = event?.data;
                         if (data instanceof ArrayBuffer) {
                             sendPcmBuffer(data);
@@ -1257,6 +1431,14 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                             sendPcmBuffer(data.buffer);
                         }
                     };
+                    try {
+                        audioWorkletNode.port.postMessage({
+                            type: "setPaused",
+                            paused: audioProcessingPaused,
+                        });
+                    } catch {
+                        // ignore
+                    }
 
                     audioSource.connect(audioWorkletNode);
                     audioWorkletNode.connect(muteGain);
@@ -1297,8 +1479,7 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
         const bufferSize = getAudioChunkSize();
         audioProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
         audioProcessor.onaudioprocess = (event) => {
-            if (!isRecording) return;
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (audioProcessingPaused || (!isRecording && !isConnecting)) return;
 
             const input = event.inputBuffer.getChannelData(0);
             const pcm16 = downsampleTo16kHz(input, audioContext.sampleRate);
@@ -1354,13 +1535,57 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
         }
     }
 
+    function scheduleStandbyTeardown() {
+        if (standbyTimer) {
+            try {
+                clearTimeout(standbyTimer);
+            } catch {
+                // ignore
+            }
+            standbyTimer = null;
+        }
+
+        const ms = Number(settings.hotStandbyMs);
+        const delay = Number.isFinite(ms) ? ms : 0;
+        if (delay <= 0) {
+            teardownAudioResources();
+            return;
+        }
+
+        standbyTimer = setTimeout(() => {
+            standbyTimer = null;
+            if (isRecording || isConnecting) {
+                return;
+            }
+            teardownAudioResources();
+        }, delay);
+    }
+
+    function teardownAudioResources() {
+        stopAudioStreaming();
+        stopMediaStream();
+        audioProcessingPaused = false;
+        if (audioContext && audioContext.state === "running") {
+            try {
+                audioContext.suspend();
+            } catch {
+                // ignore
+            }
+        }
+    }
+
     // Start recording
     async function startRecording() {
-        if (isRecording) return;
+        if (isRecording || isConnecting) return;
 
         try {
             // Ensure we have settings loaded (avoid re-loading on every start).
             await loadSettings();
+
+            if (standbyTimer) {
+                clearTimeout(standbyTimer);
+                standbyTimer = null;
+            }
 
             notifyConnectionStatus("connecting");
 
@@ -1371,32 +1596,42 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
             const audioOk = await initializeAudio();
             if (!audioOk) return;
 
-            // Connect to WebSocket
-            const jwt = await jwtPromise;
-            await connectWebSocketWithRetry({ jwt });
-
+            // Start capturing audio immediately; queue audio while WebSocket connects.
+            isConnecting = true;
             isRecording = true;
             sessionId++;
             authRegionFallbackAttempted = false;
             currentTranscript = "";
             currentPartial = "";
             lastSpeechTime = Date.now();
+            lastFinalTranscriptAt = 0;
             retryingStartConfig = false;
             startConfigTried = new Set();
             // Default to the most explicit-but-permissive schema first.
             startConfigVariant = 2;
+            clearPendingAudio();
 
-            // Start raw PCM streaming to Speechmatics.
+            setAudioProcessingPaused(false);
             await startAudioStreaming();
 
-            // Notify UI
+            // Notify UI immediately for instant mic feedback.
             notifyMicStatus(true);
+
+            // Connect to WebSocket
+            const jwt = await jwtPromise;
+            await connectWebSocketWithRetry({ jwt });
+
+            isConnecting = false;
             log("Recording started");
         } catch (error) {
             log("Start recording error:", error);
+            isConnecting = false;
             isRecording = false;
+            setAudioProcessingPaused(true);
             notifyMicStatus(false);
-            await closeWebSocket();
+            clearPendingAudio();
+            scheduleStandbyTeardown();
+            await closeWebSocket({ drain: false });
         }
     }
 
@@ -1409,31 +1644,56 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
         if (!isRecording) return;
 
         isRecording = false;
+        isConnecting = false;
         spacebarPushToTalkActive = false;
         // Capture before we clear buffers.
         const shouldForceAutoEnter = Boolean(forceAutoEnter);
         const hasAutoEnterOverride = typeof autoEnter === "boolean";
 
-        stopAudioStreaming();
+        setAudioProcessingPaused(true);
+        clearPendingAudio();
+        scheduleStandbyTeardown();
 
         // Clear timeouts
         if (silenceTimeout) {
             clearTimeout(silenceTimeout);
         }
 
-        // Close WebSocket
-        await closeWebSocket();
-
-        // Notify UI
+        // Notify UI immediately for instant mic feedback
         notifyMicStatus(false);
+
+        // Close WebSocket
+        await closeWebSocket({ drain: true, timeoutMs: FINAL_DRAIN_TIMEOUT_MS });
 
         // Finalize session: UI already received committed chunks in real-time.
         // This event is used to (optionally) auto-send the ChatGPT message and clear the partial overlay.
         // Safety: if Speechmatics didn't emit an AddTranscript for the last utterance yet,
         // fall back to committing the last partial so we don't lose text.
-        if ((!currentTranscript || !currentTranscript.trim()) && currentPartial && currentPartial.trim()) {
-            currentTranscript += currentPartial;
-            notifyCommittedTranscription(currentPartial);
+        if (currentPartial && currentPartial.trim()) {
+            const committed = (currentTranscript || "").trim();
+            const partial = currentPartial.trim();
+            let tail = "";
+            if (!committed) {
+                tail = partial;
+            } else if (partial.startsWith(committed)) {
+                tail = partial.slice(committed.length).trimStart();
+            } else {
+                const maxCheck = Math.min(committed.length, partial.length, 100);
+                for (let len = maxCheck; len > 0; len--) {
+                    if (committed.slice(-len) === partial.slice(0, len)) {
+                        tail = partial.slice(len).trimStart();
+                        break;
+                    }
+                }
+                if (!tail) {
+                    tail = partial;
+                }
+            }
+
+            if (tail) {
+                currentTranscript = committed ? `${committed} ${tail}` : tail;
+                notifyCommittedTranscription(tail);
+            }
             notifyPartialTranscription("");
         }
 
@@ -1450,38 +1710,59 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
     }
 
     // Close WebSocket connection
-    function closeWebSocket() {
-        return new Promise((resolve) => {
-            if (ws) {
-                // Invalidate any in-flight callbacks from this socket immediately.
-                activeMessageEpoch = ++messageEpoch;
+    async function closeWebSocket({ drain = false, timeoutMs = 1000 } = {}) {
+        if (!ws) {
+            return;
+        }
 
-                const timeout = setTimeout(() => {
-                    if (ws) {
-                        ws.close();
-                        ws = null;
-                    }
-                    resolve();
-                }, 1000);
+        const socket = ws;
+        const closingEpoch = activeMessageEpoch;
+        const shouldDrain = drain && socket.readyState === WebSocket.OPEN;
 
-                ws.onclose = () => {
-                    clearTimeout(timeout);
-                    resolve();
+        if (shouldDrain) {
+            try {
+                const eos = {
+                    message: "EndOfStream",
+                    last_seq_no: lastSeqNo >= 0 ? lastSeqNo : 0,
                 };
+                socket.send(JSON.stringify(eos));
+            } catch {
+                // ignore
+            }
 
-                // Send EndOfStream if still connected
-                if (ws.readyState === WebSocket.OPEN) {
-                    // Speechmatics expects last_seq_no to match the last AudioAdded seq_no.
-                    const eos = {
-                        message: "EndOfStream",
-                        last_seq_no: lastSeqNo >= 0 ? lastSeqNo : 0,
-                    };
-                    ws.send(JSON.stringify(eos));
-                }
-            } else {
+            const drainPromise = new Promise((resolve) => {
+                pendingDrainResolve = resolve;
+            });
+
+            await Promise.race([drainPromise, sleep(FINAL_DRAIN_TIMEOUT_MS)]);
+            resolveDrainWaiter();
+        } else {
+            // Invalidate any in-flight callbacks from this socket immediately.
+            activeMessageEpoch = ++messageEpoch;
+        }
+
+        await new Promise((resolve) => {
+            const timeout = setTimeout(resolve, timeoutMs);
+
+            socket.onclose = () => {
+                clearTimeout(timeout);
                 resolve();
+            };
+
+            try {
+                socket.close();
+            } catch {
+                // ignore
             }
         });
+
+        if (ws === socket) {
+            ws = null;
+        }
+        if (activeMessageEpoch === closingEpoch) {
+            activeMessageEpoch = ++messageEpoch;
+        }
+        resolveDrainWaiter();
     }
 
     // Emit events to the ChatGPT content script (same tab). This avoids relying on a
@@ -1767,6 +2048,12 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                 });
                 if (changes.speechmaticsApiKey) settings.apiKey = changes.speechmaticsApiKey.newValue || null;
                 if (changes.apiKey) settings.apiKey = changes.apiKey.newValue || null;
+                if (changes.prebufferMs) {
+                    updatePrebufferLimit();
+                }
+                if (changes.lowLatencyAudio && !isRecording) {
+                    stopMediaStream();
+                }
             }
             if (areaName === "local" && changes.apiKey) {
                 settings.apiKey = changes.apiKey.newValue || null;

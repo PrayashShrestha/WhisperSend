@@ -23,6 +23,23 @@ class Pcm16DownsamplerProcessor extends AudioWorkletProcessor {
         this._write = 0;
         this._read = 0;
         this._available = 0;
+        this._paused = false;
+
+        this.port.onmessage = (event) => {
+            const data = event?.data || {};
+            if (data.type === "setPaused") {
+                this._paused = Boolean(data.paused);
+                if (this._paused) {
+                    this._write = 0;
+                    this._read = 0;
+                    this._available = 0;
+                }
+            } else if (data.type === "reset") {
+                this._write = 0;
+                this._read = 0;
+                this._available = 0;
+            }
+        };
     }
 
     _push(input) {
@@ -92,6 +109,10 @@ class Pcm16DownsamplerProcessor extends AudioWorkletProcessor {
             output.set(input);
         }
 
+        if (this._paused) {
+            return true;
+        }
+
         if (!input || input.length === 0) {
             return true;
         }
@@ -115,4 +136,3 @@ class Pcm16DownsamplerProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
-
