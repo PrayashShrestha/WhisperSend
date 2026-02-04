@@ -23,6 +23,8 @@ const autoEnterToggle = document.querySelector("#auto-enter");
 const autoSubmitMessageToggle = document.querySelector("#auto-submit-message");
 const showPartialTranscriptToggle = document.querySelector("#show-partial-transcript");
 const debugToggle = document.querySelector("#debug-mode");
+const allowEditToggle = document.querySelector("#allow-edit-transcription");
+const editResumeDelayInput = document.querySelector("#edit-resume-delay");
 
 // Mode Elements
 const modeTimerRadio = document.querySelector("#mode-timer");
@@ -45,6 +47,8 @@ const SETTINGS_DEFAULTS = {
     showPartialTranscript: true,
     debug: false,
     preferredAudioInputDeviceId: null,
+    allowEditWhileTranscribing: false,
+    cursorPinIdleMs: 500,
     promptChecklist: [
         { id: "prompt", text: "Make sure to have this in your response", checked: false },
         { id: "professional", text: "Respond the answer in a professional way", checked: false },
@@ -328,6 +332,15 @@ function loadSettings() {
         autoSubmitMessageToggle.checked = Boolean(items.autoSubmitMessage);
         showPartialTranscriptToggle.checked = Boolean(items.showPartialTranscript !== false);
         debugToggle.checked = Boolean(items.debug);
+        if (allowEditToggle) {
+            allowEditToggle.checked = Boolean(items.allowEditWhileTranscribing);
+        }
+        if (editResumeDelayInput) {
+            const delayMs = Number(items.cursorPinIdleMs);
+            const normalized = Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : 500;
+            editResumeDelayInput.value = (normalized / 1000).toFixed(1);
+            editResumeDelayInput.disabled = !Boolean(items.allowEditWhileTranscribing);
+        }
 
         const preferredDeviceId =
             typeof items.preferredAudioInputDeviceId === "string"
@@ -461,6 +474,27 @@ showPartialTranscriptToggle.addEventListener("change", () => {
 
 debugToggle.addEventListener("change", () => {
     chrome.storage.sync.set({ debug: debugToggle.checked });
+});
+
+allowEditToggle?.addEventListener("change", () => {
+    const enabled = Boolean(allowEditToggle.checked);
+    if (editResumeDelayInput) {
+        editResumeDelayInput.disabled = !enabled;
+    }
+    chrome.storage.sync.set({ allowEditWhileTranscribing: enabled });
+});
+
+editResumeDelayInput?.addEventListener("change", () => {
+    let value = parseFloat(editResumeDelayInput.value);
+    if (!Number.isFinite(value) || value < 0) {
+        value = 0.5;
+    }
+    if (value > 5) {
+        value = 5;
+    }
+    editResumeDelayInput.value = value.toFixed(1);
+    const delayMs = Math.round(value * 1000);
+    chrome.storage.sync.set({ cursorPinIdleMs: delayMs });
 });
 
 refreshMicsBtn?.addEventListener("click", () => {

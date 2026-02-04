@@ -20,6 +20,8 @@ const SETTINGS_DEFAULTS = {
     transcriptionMode: "timer",
     autoSubmitDelayMs: 2000,
     autoEnterAfterSubmit: true,
+    allowEditWhileTranscribing: false,
+    cursorPinIdleMs: 500,
 };
 
 let settingsCache = { ...SETTINGS_DEFAULTS };

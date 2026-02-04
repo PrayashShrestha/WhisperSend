@@ -20,6 +20,7 @@ try {
 const SpeechmasticsTranscriber = (() => {
     const WEBSOCKET_URL = "wss://eu.rt.speechmatics.com/v2";
     const TARGET_SAMPLE_RATE = 16000;
+    const AUDIO_CHUNK_SIZE = 2048; // Smaller chunks reduce latency at the cost of slightly higher CPU/network overhead.
     let sessionId = 0;
     // Guards against late WebSocket events from a previous connection instance.
     // Each (re)connect increments the epoch; message handlers ignore stale epochs.
@@ -58,6 +59,9 @@ const SpeechmasticsTranscriber = (() => {
     let audioSource = null;
     let audioProcessor = null; // ScriptProcessorNode
     let audioWorkletNode = null; // AudioWorkletNode
+    let audioTrackProcessor = null; // MediaStreamTrackProcessor
+    let audioTrackReader = null;
+    let audioTrackReadAbort = false;
     let muteGain = null;
     let lastSpeechTime = 0;
     let silenceTimeout = null;
@@ -85,6 +89,10 @@ const SpeechmasticsTranscriber = (() => {
         if (settings.debug) {
             console.log("[SpeechmasticsTranscriber]", ...args);
         }
+    }
+
+    function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     // Load settings from chrome storage
@@ -368,7 +376,7 @@ const SpeechmasticsTranscriber = (() => {
     }
 
     // Connect to Speechmatics WebSocket
-    async function connectWebSocket({ jwt } = {}) {
+    async function connectWebSocket({ jwt, suppressErrors = false } = {}) {
         try {
             const token = typeof jwt === "string" && jwt ? jwt : await getTempKey();
             const url = `${WEBSOCKET_URL}?jwt=${encodeURIComponent(token)}`;
@@ -396,15 +404,19 @@ const SpeechmasticsTranscriber = (() => {
                 ws.onerror = (error) => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket error:", error);
-                    notifyConnectionStatus("error");
-                    notifyError("Transcription service error. Please try again.", "connection");
+                    if (!suppressErrors) {
+                        notifyConnectionStatus("error");
+                        notifyError("Transcription service error. Please try again.", "connection");
+                    }
                     reject(error);
                 };
 
                 ws.onclose = () => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket closed");
-                    notifyConnectionStatus("error");
+                    if (!suppressErrors) {
+                        notifyConnectionStatus("error");
+                    }
                     ws = null;
                 };
 
@@ -417,17 +429,40 @@ const SpeechmasticsTranscriber = (() => {
             });
         } catch (error) {
             log("Connection error:", error);
-            if (error.message.includes("API key")) {
-                notifyError("API key not configured. Please set it in settings.", "error");
-            } else if (error.message.includes("Failed to obtain session token")) {
-                notifyError(error.message, "error");
-            } else if (error.message.includes("timeout")) {
-                notifyError("Connection timeout. Please try again.", "timeout");
-            } else {
-                notifyError("Failed to connect to the transcription service. Please try again.", "connection");
+            if (!suppressErrors) {
+                if (error.message.includes("API key")) {
+                    notifyError("API key not configured. Please set it in settings.", "error");
+                } else if (error.message.includes("Failed to obtain session token")) {
+                    notifyError(error.message, "error");
+                } else if (error.message.includes("timeout")) {
+                    notifyError("Connection timeout. Please try again.", "timeout");
+                } else {
+                    notifyError("Failed to connect to the transcription service. Please try again.", "connection");
+                }
             }
             throw error;
         }
+    }
+
+    async function connectWebSocketWithRetry({ jwt, maxRetries = 5 } = {}) {
+        let lastError = null;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            const suppressErrors = attempt < maxRetries - 1;
+            try {
+                await connectWebSocket({ jwt, suppressErrors });
+                return;
+            } catch (error) {
+                lastError = error;
+                await closeWebSocket();
+                if (attempt >= maxRetries - 1) {
+                    break;
+                }
+                const delayMs = Math.min(16000, Math.pow(2, attempt) * 1000);
+                log(`WebSocket retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
+                await sleep(delayMs);
+            }
+        }
+        throw lastError || new Error("WebSocket connection failed");
     }
 
     function buildStartRecognitionConfig() {
@@ -526,6 +561,9 @@ const SpeechmasticsTranscriber = (() => {
     function handleMessage(data) {
         try {
             const message = JSON.parse(data);
+            if (!message || typeof message !== "object" || typeof message.message !== "string") {
+                return;
+            }
             log("Message received:", message.message);
 
             if (message.message === "AddPartialTranscript") {
@@ -561,29 +599,73 @@ const SpeechmasticsTranscriber = (() => {
         }
     }
 
+    function extractTranscriptText(message) {
+        if (typeof message?.metadata?.transcript === "string") {
+            return message.metadata.transcript;
+        }
+        if (typeof message?.transcript === "string") {
+            return message.transcript;
+        }
+        const results = message?.results || message?.metadata?.results;
+        if (Array.isArray(results) && results.length) {
+            let text = "";
+            for (const result of results) {
+                if (result?.type === "word" && result.alternatives && result.alternatives[0]) {
+                    text += result.alternatives[0].content + " ";
+                }
+            }
+            return text.trim();
+        }
+        return "";
+    }
+
+    function extractWordSegments(message) {
+        const results = message?.metadata?.results || message?.results;
+        if (!Array.isArray(results)) {
+            return [];
+        }
+
+        const segments = [];
+        for (const result of results) {
+            if (result?.type !== "word") continue;
+            const alt = result.alternatives && result.alternatives[0] ? result.alternatives[0] : null;
+            const text = alt?.content;
+            if (!text) continue;
+
+            segments.push({
+                text: String(text),
+                confidence:
+                    typeof alt?.confidence === "number" ? alt.confidence : null,
+                startTime:
+                    typeof result.start_time === "number" ? result.start_time : null,
+                endTime:
+                    typeof result.end_time === "number" ? result.end_time : null,
+            });
+        }
+
+        return segments;
+    }
+
+    function computeAverageConfidence(segments) {
+        if (!Array.isArray(segments) || segments.length === 0) {
+            return null;
+        }
+        let total = 0;
+        let count = 0;
+        for (const seg of segments) {
+            if (typeof seg.confidence === "number") {
+                total += seg.confidence;
+                count += 1;
+            }
+        }
+        if (!count) return null;
+        return total / count;
+    }
+
     // Handle partial transcript (real-time updates)
     function handlePartialTranscript(message) {
         // Per Speechmatics docs, transcript text is in `metadata.transcript`.
-        const transcript =
-            typeof message?.metadata?.transcript === "string"
-                ? message.metadata.transcript
-                : typeof message?.transcript === "string"
-                  ? message.transcript
-                : message?.results && message.results.length
-                  ? (() => {
-                        let partialText = "";
-                        for (const result of message.results) {
-                            if (
-                                result.type === "word" &&
-                                result.alternatives &&
-                                result.alternatives[0]
-                            ) {
-                                partialText += result.alternatives[0].content + " ";
-                            }
-                        }
-                        return partialText.trim();
-                    })()
-                  : "";
+        const transcript = extractTranscriptText(message);
 
         if (transcript && transcript.trim()) {
             lastSpeechTime = Date.now();
@@ -595,26 +677,9 @@ const SpeechmasticsTranscriber = (() => {
     // Handle final transcript
     function handleFinalTranscript(message) {
         // Per Speechmatics docs, transcript text is in `metadata.transcript`.
-        const transcript =
-            typeof message?.metadata?.transcript === "string"
-                ? message.metadata.transcript
-                : typeof message?.transcript === "string"
-                  ? message.transcript
-                : message?.results && message.results.length
-                  ? (() => {
-                        let finalText = "";
-                        for (const result of message.results) {
-                            if (
-                                result.type === "word" &&
-                                result.alternatives &&
-                                result.alternatives[0]
-                            ) {
-                                finalText += result.alternatives[0].content + " ";
-                            }
-                        }
-                        return finalText.trim();
-                    })()
-                  : "";
+        const transcript = extractTranscriptText(message);
+        const wordSegments = extractWordSegments(message);
+        const confidence = computeAverageConfidence(wordSegments);
 
         if (transcript && transcript.trim()) {
             // `transcript` is already formatted for concatenation (spacing/punctuation)
@@ -626,7 +691,10 @@ const SpeechmasticsTranscriber = (() => {
 
             // Commit finalized words into the ChatGPT textbox immediately so that later partials
             // don't overwrite earlier speech.
-            notifyCommittedTranscription(transcript);
+            notifyCommittedTranscription(transcript, {
+                confidence,
+                wordSegments: wordSegments.length ? wordSegments : null,
+            });
             // Clear partial overlay in UI.
             notifyPartialTranscription("");
         }
@@ -700,16 +768,238 @@ const SpeechmasticsTranscriber = (() => {
     }
 
     let audioWorkletLoadPromise = null;
-    function ensureAudioWorkletLoaded() {
+    let audioWorkletInitFailedOnce = false;
+    let audioWorkletModuleSource = null;
+    let audioWorkletModuleBlobUrl = null;
+    let audioWorkletModuleDataUrl = null;
+    const INLINE_PCM16_WORKLET_SOURCE = `/* eslint-disable no-restricted-globals */
+/**
+ * AudioWorkletProcessor that:
+ * - Buffers input Float32 PCM
+ * - Downsamples to a target sample rate (defaults to 16kHz)
+ * - Converts to signed 16-bit PCM (little-endian via Int16Array)
+ * - Posts ArrayBuffer chunks back to the main thread
+ *
+ * The main thread can forward these buffers to a WebSocket directly.
+ */
+
+class Pcm16DownsamplerProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+        super();
+
+        const processorOptions = options?.processorOptions || {};
+        this._targetSampleRate = Number(processorOptions.targetSampleRate) || 16000;
+        this._chunkSize = Math.max(256, Number(processorOptions.chunkSize) || 4096);
+
+        // Circular buffer to accumulate input samples so we can process in larger chunks.
+        this._capacity = Math.max(this._chunkSize * 4, 16384);
+        this._buffer = new Float32Array(this._capacity);
+        this._write = 0;
+        this._read = 0;
+        this._available = 0;
+    }
+
+    _push(input) {
+        // If we overflow, drop newest samples (keeps audio graph alive without crashing).
+        for (let i = 0; i < input.length; i++) {
+            if (this._available >= this._capacity) {
+                return;
+            }
+            this._buffer[this._write] = input[i];
+            this._write = (this._write + 1) % this._capacity;
+            this._available++;
+        }
+    }
+
+    _popChunk(out) {
+        for (let i = 0; i < out.length; i++) {
+            out[i] = this._buffer[this._read];
+            this._read = (this._read + 1) % this._capacity;
+        }
+        this._available -= out.length;
+    }
+
+    _floatTo16BitPcm(f32) {
+        const out = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+            const s = Math.max(-1, Math.min(1, f32[i]));
+            out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        return out;
+    }
+
+    // Simple downsampler for speech: averages samples within each output frame.
+    _downsampleToTargetRate(input, inputSampleRate) {
+        if (!input || input.length === 0) return new Int16Array(0);
+        if (inputSampleRate === this._targetSampleRate) {
+            return this._floatTo16BitPcm(input);
+        }
+
+        const ratio = inputSampleRate / this._targetSampleRate;
+        const newLength = Math.max(1, Math.round(input.length / ratio));
+        const result = new Int16Array(newLength);
+
+        let offsetBuffer = 0;
+        for (let i = 0; i < newLength; i++) {
+            const nextOffsetBuffer = Math.round((i + 1) * ratio);
+            let sum = 0;
+            let count = 0;
+            for (let j = offsetBuffer; j < nextOffsetBuffer && j < input.length; j++) {
+                sum += input[j];
+                count++;
+            }
+            offsetBuffer = nextOffsetBuffer;
+            const avg = count ? sum / count : 0;
+            const s = Math.max(-1, Math.min(1, avg));
+            result[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+
+        return result;
+    }
+
+    process(inputs, outputs) {
+        const input = inputs?.[0]?.[0];
+        const output = outputs?.[0]?.[0];
+
+        // Keep the node "active" by passing audio through (it will be muted by GainNode in main thread).
+        if (input && output) {
+            output.set(input);
+        }
+
+        if (!input || input.length === 0) {
+            return true;
+        }
+
+        this._push(input);
+
+        // Use the global worklet \`sampleRate\` (same as the AudioContext rate).
+        while (this._available >= this._chunkSize) {
+            const chunk = new Float32Array(this._chunkSize);
+            this._popChunk(chunk);
+
+            const pcm16 = this._downsampleToTargetRate(chunk, sampleRate);
+            if (pcm16.length > 0) {
+                // Transfer the underlying ArrayBuffer for efficiency.
+                this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+            }
+        }
+
+        return true;
+    }
+}
+
+registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
+`;
+
+    function resetAudioWorkletModuleCache() {
+        if (audioWorkletModuleBlobUrl) {
+            try {
+                URL.revokeObjectURL(audioWorkletModuleBlobUrl);
+            } catch {
+                // ignore
+            }
+            audioWorkletModuleBlobUrl = null;
+        }
+        audioWorkletModuleDataUrl = null;
+        audioWorkletModuleSource = null;
+    }
+
+    async function tryLoadAudioWorkletWithBlob(baseUrl, { forceReload = false } = {}) {
+        if (!audioWorkletModuleSource || forceReload) {
+            const response = await fetch(baseUrl, { cache: forceReload ? "no-store" : "default" });
+            if (!response.ok) {
+                throw new Error(`Worklet fetch failed (HTTP ${response.status})`);
+            }
+            audioWorkletModuleSource = await response.text();
+        }
+
+        if (!audioWorkletModuleSource) {
+            throw new Error("Worklet source empty after fetch");
+        }
+
+        const blob = new Blob([audioWorkletModuleSource], { type: "application/javascript" });
+        audioWorkletModuleBlobUrl = URL.createObjectURL(blob);
+        await audioContext.audioWorklet.addModule(audioWorkletModuleBlobUrl);
+        return "blob-url";
+    }
+
+    function base64FromUtf8(text) {
+        const bytes = new TextEncoder().encode(text);
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+    }
+
+    async function tryLoadAudioWorkletWithDataUrl(baseUrl) {
+        if (!audioWorkletModuleSource) {
+            const response = await fetch(baseUrl, { cache: "no-store" });
+            if (!response.ok) {
+                throw new Error(`Worklet fetch failed (HTTP ${response.status})`);
+            }
+            audioWorkletModuleSource = await response.text();
+        }
+
+        const base64 = base64FromUtf8(audioWorkletModuleSource);
+        audioWorkletModuleDataUrl = `data:application/javascript;base64,${base64}`;
+        await audioContext.audioWorklet.addModule(audioWorkletModuleDataUrl);
+        return "data-url";
+    }
+
+    async function tryLoadAudioWorkletInline() {
+        const base64 = base64FromUtf8(INLINE_PCM16_WORKLET_SOURCE);
+        const inlineUrl = `data:application/javascript;base64,${base64}`;
+        await audioContext.audioWorklet.addModule(inlineUrl);
+        return "inline-data-url";
+    }
+
+    function ensureAudioWorkletLoaded({ forceReload = false } = {}) {
         if (!audioContext?.audioWorklet) {
             return Promise.reject(new Error("AudioWorklet not supported"));
         }
-        if (audioWorkletLoadPromise) {
+        if (audioWorkletLoadPromise && !forceReload) {
             return audioWorkletLoadPromise;
         }
 
-        const url = chrome.runtime.getURL("src/content/worklets/pcm16-downsampler.js");
-        audioWorkletLoadPromise = audioContext.audioWorklet.addModule(url);
+        if (forceReload) {
+            audioWorkletLoadPromise = null;
+            resetAudioWorkletModuleCache();
+        }
+
+        const baseUrl = chrome.runtime.getURL("src/content/worklets/pcm16-downsampler.js");
+        const url = forceReload ? `${baseUrl}?v=${Date.now()}` : baseUrl;
+        audioWorkletLoadPromise = (async () => {
+            try {
+                await audioContext.audioWorklet.addModule(url);
+                log("AudioWorklet module loaded via extension URL");
+                return "extension-url";
+            } catch (error) {
+                log("AudioWorklet addModule failed for extension URL:", error);
+                try {
+                    const method = await tryLoadAudioWorkletWithBlob(baseUrl, { forceReload });
+                    log("AudioWorklet module loaded via blob URL");
+                    return method;
+                } catch (blobError) {
+                    log("AudioWorklet addModule failed for blob URL:", blobError);
+                    try {
+                        const method = await tryLoadAudioWorkletWithDataUrl(baseUrl);
+                        log("AudioWorklet module loaded via data URL");
+                        return method;
+                    } catch (dataError) {
+                        log("AudioWorklet addModule failed for data URL:", dataError);
+                        const method = await tryLoadAudioWorkletInline();
+                        log("AudioWorklet module loaded via inline data URL");
+                        return method;
+                    }
+                }
+            }
+        })().catch((error) => {
+            // Allow retry later (warm-up might fail before user gesture).
+            audioWorkletLoadPromise = null;
+            throw error;
+        });
         return audioWorkletLoadPromise;
     }
 
@@ -723,14 +1013,99 @@ const SpeechmasticsTranscriber = (() => {
         }
     }
 
+    async function startTrackProcessorStreaming(track) {
+        if (!track || typeof MediaStreamTrackProcessor === "undefined") {
+            return false;
+        }
+        if (audioTrackProcessor || audioTrackReader) {
+            return true;
+        }
+
+        try {
+            audioTrackReadAbort = false;
+            audioTrackProcessor = new MediaStreamTrackProcessor({ track });
+            audioTrackReader = audioTrackProcessor.readable.getReader();
+
+            (async () => {
+                while (!audioTrackReadAbort) {
+                    let value = null;
+                    try {
+                        const { value: frame, done } = await audioTrackReader.read();
+                        if (done || audioTrackReadAbort) break;
+                        if (!frame) continue;
+                        value = frame;
+
+                        if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) {
+                            value.close();
+                            continue;
+                        }
+
+                        const frames = value.numberOfFrames;
+                        if (!frames) {
+                            value.close();
+                            continue;
+                        }
+
+                        const f32 = new Float32Array(frames);
+                        value.copyTo(f32, { planeIndex: 0 });
+                        const pcm16 = downsampleTo16kHz(f32, value.sampleRate);
+                        sendPcmChunk(pcm16);
+                        value.close();
+                    } catch (err) {
+                        if (value) {
+                            try {
+                                value.close();
+                            } catch {
+                                // ignore
+                            }
+                        }
+                        if (!audioTrackReadAbort) {
+                            log("MediaStreamTrackProcessor read failed:", err);
+                        }
+                        break;
+                    }
+                }
+            })();
+
+            log("MediaStreamTrackProcessor attached");
+            return true;
+        } catch (error) {
+            log("MediaStreamTrackProcessor init failed:", error);
+            try {
+                audioTrackReader?.cancel?.();
+            } catch {
+                // ignore
+            }
+            audioTrackReader = null;
+            audioTrackProcessor = null;
+            return false;
+        }
+    }
+
+    function stopTrackProcessorStreaming() {
+        audioTrackReadAbort = true;
+        if (audioTrackReader) {
+            try {
+                audioTrackReader.cancel();
+            } catch {
+                // ignore
+            }
+        }
+        audioTrackReader = null;
+        audioTrackProcessor = null;
+    }
+
     async function startAudioStreaming() {
         if (!audioContext || !mediaStream) return;
-        if (audioSource || audioProcessor || audioWorkletNode) return;
+        if (audioSource || audioProcessor || audioWorkletNode || audioTrackProcessor || audioTrackReader) return;
 
-        audioSource = audioContext.createMediaStreamSource(mediaStream);
-
-        muteGain = audioContext.createGain();
-        muteGain.gain.value = 0;
+        if (audioContext.state === "suspended") {
+            try {
+                await audioContext.resume();
+            } catch {
+                // ignore; we'll still attempt to start nodes
+            }
+        }
 
         // Prefer AudioWorkletNode (ScriptProcessorNode is deprecated and logs warnings).
         const canUseWorklet =
@@ -742,13 +1117,17 @@ const SpeechmasticsTranscriber = (() => {
             try {
                 await ensureAudioWorkletLoaded();
 
+                audioSource = audioContext.createMediaStreamSource(mediaStream);
+                muteGain = audioContext.createGain();
+                muteGain.gain.value = 0;
+
                 audioWorkletNode = new AudioWorkletNode(audioContext, "pcm16-downsampler", {
                     numberOfInputs: 1,
                     numberOfOutputs: 1,
                     outputChannelCount: [1],
                     processorOptions: {
                         targetSampleRate: TARGET_SAMPLE_RATE,
-                        chunkSize: 4096,
+                        chunkSize: AUDIO_CHUNK_SIZE,
                     },
                 });
 
@@ -769,7 +1148,50 @@ const SpeechmasticsTranscriber = (() => {
                 muteGain.connect(audioContext.destination);
                 return;
             } catch (error) {
+                if (!audioWorkletInitFailedOnce) {
+                    audioWorkletInitFailedOnce = true;
+                    console.warn(
+                        "[SpeechmasticsTranscriber] AudioWorklet init failed; falling back to ScriptProcessorNode:",
+                        error
+                    );
+                }
                 log("AudioWorklet init failed; falling back to ScriptProcessorNode:", error);
+                // Retry once with a cache-busted module URL in case of stale/cached failure.
+                try {
+                    await ensureAudioWorkletLoaded({ forceReload: true });
+
+                    audioSource = audioContext.createMediaStreamSource(mediaStream);
+                    muteGain = audioContext.createGain();
+                    muteGain.gain.value = 0;
+
+                    audioWorkletNode = new AudioWorkletNode(audioContext, "pcm16-downsampler", {
+                        numberOfInputs: 1,
+                        numberOfOutputs: 1,
+                        outputChannelCount: [1],
+                        processorOptions: {
+                            targetSampleRate: TARGET_SAMPLE_RATE,
+                            chunkSize: AUDIO_CHUNK_SIZE,
+                        },
+                    });
+
+                    audioWorkletNode.port.onmessage = (event) => {
+                        if (!isRecording) return;
+                        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                        const data = event?.data;
+                        if (data instanceof ArrayBuffer) {
+                            sendPcmBuffer(data);
+                        } else if (data?.buffer instanceof ArrayBuffer) {
+                            sendPcmBuffer(data.buffer);
+                        }
+                    };
+
+                    audioSource.connect(audioWorkletNode);
+                    audioWorkletNode.connect(muteGain);
+                    muteGain.connect(audioContext.destination);
+                    return;
+                } catch (retryError) {
+                    log("AudioWorklet retry failed; using ScriptProcessorNode:", retryError);
+                }
                 if (audioWorkletNode) {
                     try {
                         audioWorkletNode.port.onmessage = null;
@@ -786,8 +1208,20 @@ const SpeechmasticsTranscriber = (() => {
             }
         }
 
-        // Fallback: ScriptProcessorNode (deprecated, but keeps older browsers working).
-        const bufferSize = 4096;
+        // Fallback 2: MediaStreamTrackProcessor (preferred over ScriptProcessorNode when available).
+        if (typeof MediaStreamTrackProcessor !== "undefined") {
+            const track = mediaStream?.getAudioTracks?.()[0] || null;
+            if (await startTrackProcessorStreaming(track)) {
+                return;
+            }
+        }
+
+        // Fallback 3: ScriptProcessorNode (deprecated, but keeps older browsers working).
+        audioSource = audioContext.createMediaStreamSource(mediaStream);
+        muteGain = audioContext.createGain();
+        muteGain.gain.value = 0;
+
+        const bufferSize = AUDIO_CHUNK_SIZE;
         audioProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
         audioProcessor.onaudioprocess = (event) => {
             if (!isRecording) return;
@@ -804,6 +1238,9 @@ const SpeechmasticsTranscriber = (() => {
     }
 
     function stopAudioStreaming() {
+        if (audioTrackProcessor || audioTrackReader) {
+            stopTrackProcessorStreaming();
+        }
         if (audioWorkletNode) {
             try {
                 audioWorkletNode.port.onmessage = null;
@@ -863,7 +1300,7 @@ const SpeechmasticsTranscriber = (() => {
 
             // Connect to WebSocket
             const jwt = await jwtPromise;
-            await connectWebSocket({ jwt });
+            await connectWebSocketWithRetry({ jwt });
 
             isRecording = true;
             sessionId++;
@@ -1121,11 +1558,22 @@ const SpeechmasticsTranscriber = (() => {
         });
     }
 
-    function notifyCommittedTranscription(text) {
-        emitToChatGpt({
+    function notifyCommittedTranscription(text, meta = null) {
+        const detail = {
             type: "appendCommittedTranscript",
             text,
-        });
+        };
+
+        if (meta && typeof meta === "object") {
+            if (typeof meta.confidence === "number") {
+                detail.confidence = meta.confidence;
+            }
+            if (Array.isArray(meta.wordSegments)) {
+                detail.wordSegments = meta.wordSegments;
+            }
+        }
+
+        emitToChatGpt(detail);
     }
 
     function notifyFinalizeTranscription({ forceAutoEnter = false, autoEnter = null } = {}) {
@@ -1219,7 +1667,7 @@ const SpeechmasticsTranscriber = (() => {
                                 startConfigVariant = 2;
 
                                 await closeWebSocket();
-                                await connectWebSocket();
+                                await connectWebSocketWithRetry();
                                 notifyConnectionStatus("connected");
                             }
 

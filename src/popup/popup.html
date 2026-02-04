@@ -371,6 +371,24 @@
         </div>
     </div>
 
+    <!-- Editing While Transcribing -->
+    <div class="card">
+        <h2>Editing While Transcribing</h2>
+        <div class="row">
+            <label for="allow-edit-transcription">
+                <input type="checkbox" id="allow-edit-transcription" />
+                Allow edits without cursor jump
+            </label>
+        </div>
+        <label for="edit-resume-delay">
+            Resume append after idle (seconds)
+            <input type="number" id="edit-resume-delay" min="0" max="5" step="0.1" value="0.5" />
+        </label>
+        <div class="hint">
+            When enabled, live appends pause while your cursor is not at the end. Double‑Shift resumes instantly.
+        </div>
+    </div>
+
     <!-- Prompt Checklist -->
     <div class="card">
         <h2>Prompt Checklist</h2>
