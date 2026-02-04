@@ -174,6 +174,7 @@ Access extension settings via popup icon in toolbar:
 | ------------ | ------------------------------- |
 | **Spacebar** | Hold = record, Release = submit |
 | **Escape**   | Delete last transcribed text    |
+| **Double-Shift** | Resume live transcription while editing |
 | (Click mic)  | Toggle recording on/off         |
 
 ---

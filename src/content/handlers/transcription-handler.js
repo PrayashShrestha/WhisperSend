@@ -18,9 +18,15 @@ try {
  */
 
 const SpeechmasticsTranscriber = (() => {
-    const WEBSOCKET_URL = "wss://eu.rt.speechmatics.com/v2";
+    const WEBSOCKET_ENDPOINTS = {
+        us: "wss://us.rt.speechmatics.com/v2",
+        eu: "wss://eu.rt.speechmatics.com/v2",
+    };
     const TARGET_SAMPLE_RATE = 16000;
-    const AUDIO_CHUNK_SIZE = 2048; // Smaller chunks reduce latency at the cost of slightly higher CPU/network overhead.
+    const AUDIO_CHUNK_FAST = 512;
+    const AUDIO_CHUNK_ACCURATE = 1024;
+    const OPERATING_POINT_FAST = "standard";
+    const OPERATING_POINT_ACCURATE = "enhanced";
     let sessionId = 0;
     // Guards against late WebSocket events from a previous connection instance.
     // Each (re)connect increments the epoch; message handlers ignore stale epochs.
@@ -37,6 +43,8 @@ const SpeechmasticsTranscriber = (() => {
         showPartialTranscript: true,
         debug: false,
         preferredAudioInputDeviceId: null,
+        speechmaticsRegion: "us",
+        latencyMode: "fast", // "fast" | "accurate"
     };
 
     // Legacy key (older versions stored apiKey in sync).
@@ -76,6 +84,7 @@ const SpeechmasticsTranscriber = (() => {
     let retryingStartConfig = false;
     let resetInProgress = false;
     let spacebarPushToTalkActive = false;
+    let authRegionFallbackAttempted = false;
 
     // Temporary key caching (browser WS can't set Authorization headers).
     let cachedTempKey = null;
@@ -89,6 +98,25 @@ const SpeechmasticsTranscriber = (() => {
         if (settings.debug) {
             console.log("[SpeechmasticsTranscriber]", ...args);
         }
+    }
+
+    function getLatencyMode() {
+        return settings.latencyMode === "accurate" ? "accurate" : "fast";
+    }
+
+    function getAudioChunkSize() {
+        return getLatencyMode() === "accurate" ? AUDIO_CHUNK_ACCURATE : AUDIO_CHUNK_FAST;
+    }
+
+    function getOperatingPoint() {
+        return getLatencyMode() === "accurate" ? OPERATING_POINT_ACCURATE : OPERATING_POINT_FAST;
+    }
+
+    function getWebsocketBaseUrl() {
+        const region = typeof settings.speechmaticsRegion === "string"
+            ? settings.speechmaticsRegion.toLowerCase()
+            : "us";
+        return WEBSOCKET_ENDPOINTS[region] || WEBSOCKET_ENDPOINTS.us;
     }
 
     function sleep(ms) {
@@ -218,9 +246,18 @@ const SpeechmasticsTranscriber = (() => {
             }
 
             if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    latencyHint: "interactive",
-                });
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                try {
+                    audioContext = new AudioCtx({
+                        latencyHint: "interactive",
+                        sampleRate: TARGET_SAMPLE_RATE,
+                    });
+                } catch (err) {
+                    // Fallback: some browsers may reject custom sample rates.
+                    audioContext = new AudioCtx({
+                        latencyHint: "interactive",
+                    });
+                }
             }
 
             // Best-effort warm-up: load the AudioWorklet module ahead of time so startRecording
@@ -379,7 +416,8 @@ const SpeechmasticsTranscriber = (() => {
     async function connectWebSocket({ jwt, suppressErrors = false } = {}) {
         try {
             const token = typeof jwt === "string" && jwt ? jwt : await getTempKey();
-            const url = `${WEBSOCKET_URL}?jwt=${encodeURIComponent(token)}`;
+            const baseUrl = getWebsocketBaseUrl();
+            const url = `${baseUrl}?jwt=${encodeURIComponent(token)}`;
 
             return new Promise((resolve, reject) => {
                 const myEpoch = ++messageEpoch;
@@ -494,7 +532,7 @@ const SpeechmasticsTranscriber = (() => {
             transcription_config: {
                 language: "en",
                 // Speechmatics currently supports: "standard" | "enhanced"
-                operating_point: "enhanced",
+                operating_point: getOperatingPoint(),
                 enable_partials: true,
             },
         };
@@ -557,6 +595,39 @@ const SpeechmasticsTranscriber = (() => {
         }
     }
 
+    async function retryWithAlternateRegionOnAuthError(reason) {
+        if (authRegionFallbackAttempted) return;
+        authRegionFallbackAttempted = true;
+
+        const current = typeof settings.speechmaticsRegion === "string"
+            ? settings.speechmaticsRegion.toLowerCase()
+            : "us";
+        const next = current === "us" ? "eu" : "us";
+
+        notifyError(
+            `Transcription error: Not Authorized (${current.toUpperCase()}). Retrying with ${next.toUpperCase()} region...`,
+            "error"
+        );
+
+        try {
+            await closeWebSocket();
+            settings.speechmaticsRegion = next;
+            try {
+                chrome.storage.sync.set({ speechmaticsRegion: next });
+            } catch {
+                // ignore
+            }
+            await connectWebSocket();
+        } catch (err) {
+            log("Retry with alternate region failed:", err);
+            notifyError(
+                `Transcription error: Not Authorized on ${current.toUpperCase()} and ${next.toUpperCase()} regions.`,
+                "error"
+            );
+            stopRecording();
+        }
+    }
+
     // Handle incoming WebSocket messages
     function handleMessage(data) {
         try {
@@ -579,7 +650,7 @@ const SpeechmasticsTranscriber = (() => {
                 log("Server error:", message.reason);
                 const reason = message.reason || "Unknown error";
                 if (String(reason).toLowerCase().includes("not authorized")) {
-                    notifyError("Transcription error: Not Authorized (check API key)", "error");
+                    retryWithAlternateRegionOnAuthError(reason);
                 } else if (
                     String(reason).toLowerCase().includes("invalid input") ||
                     String(reason).toLowerCase().includes("must validate one and only one schema") ||
@@ -1121,13 +1192,14 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                 muteGain = audioContext.createGain();
                 muteGain.gain.value = 0;
 
+                const chunkSize = getAudioChunkSize();
                 audioWorkletNode = new AudioWorkletNode(audioContext, "pcm16-downsampler", {
                     numberOfInputs: 1,
                     numberOfOutputs: 1,
                     outputChannelCount: [1],
                     processorOptions: {
                         targetSampleRate: TARGET_SAMPLE_RATE,
-                        chunkSize: AUDIO_CHUNK_SIZE,
+                        chunkSize,
                     },
                 });
 
@@ -1164,13 +1236,14 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
                     muteGain = audioContext.createGain();
                     muteGain.gain.value = 0;
 
+                    const chunkSize = getAudioChunkSize();
                     audioWorkletNode = new AudioWorkletNode(audioContext, "pcm16-downsampler", {
                         numberOfInputs: 1,
                         numberOfOutputs: 1,
                         outputChannelCount: [1],
                         processorOptions: {
                             targetSampleRate: TARGET_SAMPLE_RATE,
-                            chunkSize: AUDIO_CHUNK_SIZE,
+                            chunkSize,
                         },
                     });
 
@@ -1221,7 +1294,7 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
         muteGain = audioContext.createGain();
         muteGain.gain.value = 0;
 
-        const bufferSize = AUDIO_CHUNK_SIZE;
+        const bufferSize = getAudioChunkSize();
         audioProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
         audioProcessor.onaudioprocess = (event) => {
             if (!isRecording) return;
@@ -1304,6 +1377,7 @@ registerProcessor("pcm16-downsampler", Pcm16DownsamplerProcessor);
 
             isRecording = true;
             sessionId++;
+            authRegionFallbackAttempted = false;
             currentTranscript = "";
             currentPartial = "";
             lastSpeechTime = Date.now();

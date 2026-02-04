@@ -22,6 +22,9 @@ const SETTINGS_DEFAULTS = {
     autoEnterAfterSubmit: true,
     allowEditWhileTranscribing: false,
     cursorPinIdleMs: 500,
+    editDebounceMs: 350,
+    speechmaticsRegion: "us",
+    latencyMode: "fast",
 };
 
 let settingsCache = { ...SETTINGS_DEFAULTS };

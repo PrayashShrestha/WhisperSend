@@ -25,6 +25,7 @@
         showPartialTranscript: true,
         promptChecklist: [],
         cursorPinIdleMs: 500,
+        editDebounceMs: 350,
         allowEditWhileTranscribing: false,
     };
 
@@ -89,7 +90,19 @@
     let lastMergePartial = "";
     let cachedMergeResult = "";
     let lastRenderTime = 0;
-    const MIN_RENDER_INTERVAL_MS = 16;  // 60fps throttle (Phase 1 Fix #6)
+    const MIN_RENDER_INTERVAL_MS = 4;  // ~250fps for responsive feedback (Phase 1 Fix #6 optimized)
+    const SNAPSHOT_DEBOUNCE_MS = 1000;  // Save snapshots less frequently to avoid I/O overhead
+    let pendingSnapshotSave = null;  // Debounce timer for snapshot saves
+
+    // Display text cache to avoid rebuilding on every render
+    let cachedDisplayText = "";
+    let cachedDisplayCommitted = "";
+    let cachedDisplayRaw = "";
+    let cachedDisplayPartial = "";
+    let cachedFinalText = "";
+    let cachedFinalBase = "";
+    let cachedFinalSpeech = "";
+    let cachedFinalMode = null;
 
     function isEditActive() {
         return editState !== EditState.IDLE;
@@ -169,14 +182,6 @@
             return;
         }
 
-        if (!userEditIntent) {
-            if (userCursorPinned) {
-                userCursorPinned = false;
-                flushBufferedTranscription();
-            }
-            return;
-        }
-
         const promptEl = getPromptElement();
         if (!promptEl) {
             if (userCursorPinned) {
@@ -196,6 +201,26 @@
             }
             return;
         }
+
+        const selectionInfo = getPromptSelectionInfo(promptEl);
+        const selectionAway = selectionInfo && !isSelectionAtEnd(selectionInfo);
+
+        // If the caret is not at the end, treat this as an edit intent and pause appends.
+        if (selectionAway) {
+            userEditIntent = true;
+            if (!userCursorPinned) {
+                userCursorPinned = true;
+            }
+            scheduleCursorPinRelease();
+            return;
+        }
+
+        // If the caret returns to the end and we're not actively editing, resume appends.
+        if (!isEditActive() && !userEditDebounce && userCursorPinned) {
+            userCursorPinned = false;
+            userEditIntent = false;
+            flushBufferedTranscription();
+        }
     }
 
     function scheduleCursorPinRelease() {
@@ -210,6 +235,10 @@
         cursorPinReleaseAt = Date.now() + delay;
         cursorPinTimeout = setTimeout(() => {
             cursorPinTimeout = null;
+            // If we're actively editing, let the edit debounce decide when to release.
+            if (isEditActive() || userEditDebounce) {
+                return;
+            }
             userCursorPinned = false;
             userEditIntent = false;
             flushBufferedTranscription();
@@ -324,11 +353,23 @@
     }
 
     function saveSessionSnapshot({ force = false } = {}) {
-        const now = Date.now();
-        if (!force && now - lastSessionSnapshotAt < SESSION_SNAPSHOT_MIN_INTERVAL_MS) {
+        // Optimize: defer non-urgent saves to avoid blocking transcription updates
+        // Flush immediately on force, otherwise debounce
+        if (!force) {
+            if (pendingSnapshotSave) {
+                clearTimeout(pendingSnapshotSave);
+            }
+            pendingSnapshotSave = setTimeout(() => {
+                pendingSnapshotSave = null;
+                _saveSessionSnapshotNow();
+            }, SNAPSHOT_DEBOUNCE_MS);
             return;
         }
+        _saveSessionSnapshotNow();
+    }
 
+    function _saveSessionSnapshotNow() {
+        const now = Date.now();
         const snapshot = buildSessionSnapshot();
         if (!snapshot.base && !snapshot.committed && !snapshot.partial) {
             clearSessionSnapshot();
@@ -505,23 +546,35 @@
         }
         if (renderQueued) return;
         renderQueued = true;
-        renderRaf = requestAnimationFrame(() => {
+        // Use microtask (Promise.resolve) instead of requestAnimationFrame for faster feedback
+        // This executes before next frame instead of waiting ~16ms for next paint
+        renderRaf = Promise.resolve().then(() => {
             renderQueued = false;
             renderRaf = null;
             renderSessionTextNow();
         });
     }
 
+    // Backward-compatible helper: some legacy paths still reference renderSessionText().
+    // Keep it as a thin wrapper to avoid runtime crashes.
+    function renderSessionText() {
+        queueRender({ immediate: true });
+    }
+
     function handleTrustedUserEdit() {
         if (!isRecordingSession) return;
         if (sendResetInProgress) return;
         if (isRenderingSuspended()) return;
+        if (!isCursorPinEnabled()) return;
 
         const promptEl = getPromptElement();
         if (!promptEl) return;
 
+        log(`[FREEZE] User editing detected. Pausing transcription display for ${settings.editDebounceMs || 350}ms after pause.`);
+
         userEditIntent = true;
         userCursorPinned = true;
+
         scheduleCursorPinRelease();
 
         // The user is editing while we're still recording.
@@ -549,27 +602,38 @@
             }
         }
 
-        // OPTIMIZED: Reduce debounce from 650ms to 350ms (Phase 1 Fix #3)
-        // Still prevents rapid thrashing but feels much more responsive
+        // APPROACH A: Freeze Rendering During Edit
+        // Debounce timer fires when user stops editing (configurable, default 350ms).
+        // Flush all buffered transcription in one batch and render together.
+        const debounceMs = Number(settings.editDebounceMs) || 350;  // Configurable from popup
+        log(`[FREEZE] Edit debounce timer set to ${debounceMs}ms`);
         userEditDebounce = setTimeout(() => {
             userEditDebounce = null;
-            setEditState(EditState.REBASING);
+            log(`[FREEZE] User editing paused. Flushing buffered transcription...`);
+            setEditState(EditState.IDLE);
+            userCursorPinned = false;  // Release cursor pin
 
             try {
-                // Rebase to latest user-edited text and intelligently merge any buffered speech
-                const latest = getPromptText(promptEl);
-                const rebased = normalizePromptWithPrefix(latest);
+                const latest = getPromptText(promptEl) || "";
+                const normalized = normalizePromptWithPrefix(latest);
 
-                const snapshot = editSnapshot || captureEditSnapshot(promptEl);
-                const { baseText, speechText } = computeRebasedTexts(
-                    snapshot,
-                    rebased
-                );
+                if (editSnapshot) {
+                    const rebased = computeRebasedTexts(editSnapshot, normalized);
+                    sessionBaseText = rebased.baseText;
+                    sessionCommittedText = rebased.speechText;
+                    sessionCommittedRaw = rebased.speechText;
+                    currentPartialText = "";
+                } else {
+                    const { tail } = splitPrefix(normalized);
+                    sessionBaseText = ensurePrefix(normalized.slice(0, normalized.length - tail.length));
+                    sessionCommittedText = tail;
+                    sessionCommittedRaw = tail;
+                    currentPartialText = "";
+                }
 
-                sessionBaseText = baseText;
-                sessionCommittedText = speechText;
-
+                // Apply all buffered transcription to session state
                 if (editBufferedCommitted) {
+                    log(`[FLUSH] Applying buffered committed: "${editBufferedCommitted}"`);
                     sessionCommittedText = joinTranscriptionText(
                         sessionCommittedText,
                         editBufferedCommitted
@@ -583,36 +647,28 @@
                     );
                 }
 
-                // Treat the last visible partial as committed baseline now that the user edited.
-                sessionCommittedRaw = mergeCommittedAndPartial(
-                    sessionCommittedRaw,
-                    currentPartialText
-                );
-
-                currentPartialText = editBufferedPartial
-                    ? String(editBufferedPartial).trim()
-                    : "";
-
-                previewText = "";
-                lastRenderedSpeechText = "";
-
-                // Normalize the prefix only once after editing ends
-                // Cursor position is automatically preserved by setPromptText() when in edit mode
-                if (rebased !== latest) {
-                    suppressAutoResetFor(250);
-                    setPromptText(promptEl, rebased, { preserveCursor: true });
+                // Apply buffered partial (if any)
+                if (editBufferedPartial) {
+                    log(`[FLUSH] Applying buffered partial: "${editBufferedPartial}"`);
+                    currentPartialText = String(editBufferedPartial).trim();
                 }
-            } finally {
-                editSnapshot = null;
+
+                // Clear buffers for next edit cycle
                 editBufferedCommitted = "";
                 editBufferedCommittedRaw = "";
                 editBufferedPartial = "";
-                setEditState(EditState.IDLE);
+                previewText = "";
+                lastRenderedSpeechText = "";
+
+                // Render once with all accumulated updates
+                log(`[FLUSH] Rendering all buffered text...`);
+                queueRender({ immediate: true });
+            } finally {
+                editSnapshot = null;
             }
 
-            renderSessionTextNow();
             saveSessionSnapshot({ force: true });
-        }, 350);  // Reduced from 650ms (Phase 1 Fix #3)
+        }, debounceMs);  // Debounce time is configurable from extension popup
 
         scheduleCursorPinCheck();
     }
@@ -744,7 +800,7 @@
 
         // Ensure renderer doesn't re-hydrate with stale buffers.
         if (isRecordingSession) {
-            renderSessionText();
+            queueRender({ immediate: true });
         }
     }
 
@@ -855,6 +911,22 @@
         }
 
         return promptEl.innerText || "";
+    }
+
+    /**
+     * FAST PATH: Update textarea text with minimal overhead
+     * Skips scroll, selection, and DOM traversal
+     * Used during active transcription for maximum speed (~1-2ms)
+     */
+    function setPromptTextFast(promptEl, text) {
+        if (!promptEl) return;
+        if (promptEl.tagName === "TEXTAREA" || promptEl.tagName === "INPUT") {
+            promptEl.value = text;
+            promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+            return;
+        }
+        promptEl.innerText = text;
+        promptEl.dispatchEvent(new Event("input", { bubbles: true }));
     }
 
     function shouldPreserveSelection(promptEl) {
@@ -1217,11 +1289,17 @@
         if (isRenderingSuspended()) {
             return;
         }
-        if (isEditActive() || isCursorPinned()) {
+
+        // CRITICAL: Do not render transcription while user is editing!
+        // If we render, transcription will overwrite user's manual edits.
+        // Instead, buffer updates until user finishes editing (cursor pin release).
+        if (userCursorPinned) {
+            log(`[FREEZE] Skipping render - user is editing, updates are buffered`);
             return;
         }
 
-        // Phase 1 Fix #6: Throttle renders to 60fps max (16ms minimum interval)
+        // Phase 1 Fix #6 Optimized: Throttle renders to ~250fps (4ms minimum interval)
+        // Reduced from 16ms for lower latency and faster visual feedback during transcription
         const now = Date.now();
         if (now - lastRenderTime < MIN_RENDER_INTERVAL_MS) {
             return;  // Skip this render, next one in queue will execute when safe
@@ -1247,6 +1325,15 @@
 
         const appendMode = Boolean(settings.appendMode);
 
+        // OPTIMIZATION: Cache final text to avoid rebuilding identical strings
+        if (speechText === cachedFinalSpeech &&
+            sessionBaseText === cachedFinalBase &&
+            appendMode === cachedFinalMode) {
+            // Nothing changed, use cached final text
+            setPromptTextFast(promptEl, cachedFinalText);
+            return;
+        }
+
         let next;
         if (!appendMode) {
             next = ensurePrefix(speechText);
@@ -1255,14 +1342,16 @@
             next = joinWithSeparator(base, settings.appendSeparator, speechText);
         }
 
-        const current = getPromptText(promptEl);
-        if (current === next) return;
-        // Preserve cursor position whenever the prompt is focused
-        setPromptText(promptEl, next, { preserveCursor: true });
-    }
+        // Cache for next time
+        cachedFinalText = next;
+        cachedFinalSpeech = speechText;
+        cachedFinalBase = sessionBaseText;
+        cachedFinalMode = appendMode;
 
-    function renderSessionText() {
-        queueRender();
+        // OPTIMIZATION: Use fast path for transcription updates
+        // No need to get current text, preserve selection, or manage scrolling
+        // Just update the value directly (99% of transcription updates)
+        setPromptTextFast(promptEl, next);
     }
 
     function computePartialTail(committedRaw, partialRaw) {
@@ -1284,11 +1373,33 @@
     }
 
     function buildDisplaySpeechText() {
+        // OPTIMIZATION: Cache display text to avoid rebuilding if input hasn't changed
         const committedDisplay = sessionCommittedText || "";
         const committedRaw = sessionCommittedRaw || sessionCommittedText || "";
-        const tail = computePartialTail(committedRaw, currentPartialText || "");
-        if (!tail) return committedDisplay;
-        return joinTranscriptionText(committedDisplay, tail);
+        const partialRaw = currentPartialText || "";
+
+        // If nothing changed, return cached result
+        if (committedDisplay === cachedDisplayCommitted &&
+            committedRaw === cachedDisplayRaw &&
+            partialRaw === cachedDisplayPartial) {
+            return cachedDisplayText;
+        }
+
+        // Compute new display text
+        const tail = computePartialTail(committedRaw, partialRaw);
+        const result = !tail ? committedDisplay : joinTranscriptionText(committedDisplay, tail);
+
+        // Cache for next time
+        invalidateDisplayCache(committedDisplay, committedRaw, partialRaw);
+
+        return result;
+    }
+
+    function invalidateDisplayCache(newCommitted, newRaw, newPartial) {
+        cachedDisplayText = "";
+        cachedDisplayCommitted = newCommitted;
+        cachedDisplayRaw = newRaw;
+        cachedDisplayPartial = newPartial;
     }
 
     function appendToRawBaseline(rawText, newText) {
@@ -1979,18 +2090,28 @@
 
         // Commit confident chunks immediately so partial shrink/revisions never erase prior words.
         sessionCommittedRaw = appendToRawBaseline(sessionCommittedRaw, newText);
-        if (isEditActive() || isCursorPinned()) {
+
+        // APPROACH A: FREEZE RENDERING WHILE EDITING
+        // When user is actively editing (cursor pinned), NEVER render transcription.
+        // Just buffer it. Once user stops editing and cursor release fires, flush everything.
+        // This is the ONLY way to prevent transcription from overwriting user's manual edits.
+        if (userCursorPinned) {
+            log(`[FREEZE] Buffering committed text while user editing: "${newText}"`);
             editBufferedCommitted = joinTranscriptionText(editBufferedCommitted, newText);
+            editBufferedCommittedRaw = appendToRawBaseline(editBufferedCommittedRaw, newText);
             lastTranscribedText = newText;
-            saveSessionSnapshot();
-            return;
+            saveSessionSnapshot();  // Buffered save (debounced)
+            return;  // DO NOT RENDER - user is editing!
         }
 
+        // Normal path: Not editing, so render transcription
         sessionCommittedText = joinTranscriptionText(sessionCommittedText, newText);
         updateTranscriptionSegment("committed", newText, meta);
         lastTranscribedText = newText;
-        saveSessionSnapshot();
-        renderSessionText();
+
+        // Optimize: render IMMEDIATELY with high priority, then save snapshot debounced
+        queueRender({ immediate: true });  // Skip RAF queue for instant feedback
+        saveSessionSnapshot();  // Debounced, non-blocking
     }
 
     function handleFinalizeTranscription({ autoEnter } = {}) {
@@ -2000,7 +2121,7 @@
 
         // Do not clear partials here. The prompt already contains the latest words (including partials),
         // and the user may be sending immediately at end-of-speech.
-        renderSessionText();
+        queueRender({ immediate: true });
 
         // Never submit if the prompt has no user text (ignore static prefix).
         const promptEl = getPromptElement();
@@ -2042,16 +2163,25 @@
         if (!settings.showPartialTranscript) return;
         if (!isRecordingSession) return;
         if (isRenderingSuspended()) return;
+
+        // FREEZE RENDERING: Buffer partials while user is editing
+        // Never render partials while cursor is pinned - user is making changes!
+        if (userCursorPinned) {
+            log(`[FREEZE] Buffering partial while user editing`);
+            editBufferedPartial = String(text).trim();  // Buffer latest partial
+            return;  // DO NOT render - user is editing!
+        }
+
         // Render using current session state, which keeps committed text stable while partials change.
         previewText = text;
-        renderSessionText();
+        queueRender({ immediate: true });  // Bypass RAF for immediate partial feedback
     }
 
     // Clear partial preview
     function clearPartialPreview() {
         previewText = "";
         if (isRecordingSession) {
-            renderSessionText();
+            queueRender({ immediate: true });
         }
     }
 
@@ -2112,7 +2242,7 @@
             // Remove partial overlay when stopping recording; keep committed text.
             currentPartialText = "";
             previewText = "";
-            renderSessionText();
+            queueRender({ immediate: true });
             isRecordingSession = false;
         }
     }
@@ -2236,7 +2366,13 @@
 
                 // Allow user to edit already-transcribed text during a long recording.
                 // Only respond to trusted user edits (not our own synthetic input events).
-                if (e.isTrusted && isRecordingSession && text && !isAutoResetSuppressed()) {
+                if (
+                    e.isTrusted &&
+                    isRecordingSession &&
+                    text &&
+                    !isAutoResetSuppressed() &&
+                    isCursorPinEnabled()
+                ) {
                     handleTrustedUserEdit();
                 }
             },
@@ -2567,6 +2703,15 @@
                 userCursorPinned = false;
                 userEditIntent = false;
                 cursorPinReleaseAt = 0;
+                setEditState(EditState.IDLE);
+                if (userEditDebounce) {
+                    try {
+                        clearTimeout(userEditDebounce);
+                    } catch {
+                        // ignore
+                    }
+                    userEditDebounce = null;
+                }
                 if (cursorPinTimeout) {
                     try {
                         clearTimeout(cursorPinTimeout);

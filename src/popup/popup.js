@@ -11,6 +11,10 @@ const refreshMicsBtn = document.querySelector("#refresh-mics");
 const applyMicBtn = document.querySelector("#apply-mic");
 const micStatusDiv = document.querySelector("#mic-status");
 
+// Region Elements
+const regionSelect = document.querySelector("#speechmatics-region");
+const latencyModeSelect = document.querySelector("#latency-mode");
+
 // Prompt Checklist Elements
 const promptChecklistDiv = document.querySelector("#prompt-checklist");
 const promptNewInput = document.querySelector("#prompt-new");
@@ -25,6 +29,8 @@ const showPartialTranscriptToggle = document.querySelector("#show-partial-transc
 const debugToggle = document.querySelector("#debug-mode");
 const allowEditToggle = document.querySelector("#allow-edit-transcription");
 const editResumeDelayInput = document.querySelector("#edit-resume-delay");
+const editDebounceInput = document.querySelector("#edit-debounce");
+
 
 // Mode Elements
 const modeTimerRadio = document.querySelector("#mode-timer");
@@ -49,6 +55,9 @@ const SETTINGS_DEFAULTS = {
     preferredAudioInputDeviceId: null,
     allowEditWhileTranscribing: false,
     cursorPinIdleMs: 500,
+    editDebounceMs: 350,
+    speechmaticsRegion: "us",
+    latencyMode: "fast",
     promptChecklist: [
         { id: "prompt", text: "Make sure to have this in your response", checked: false },
         { id: "professional", text: "Respond the answer in a professional way", checked: false },
@@ -332,6 +341,20 @@ function loadSettings() {
         autoSubmitMessageToggle.checked = Boolean(items.autoSubmitMessage);
         showPartialTranscriptToggle.checked = Boolean(items.showPartialTranscript !== false);
         debugToggle.checked = Boolean(items.debug);
+        if (regionSelect) {
+            const region =
+                typeof items.speechmaticsRegion === "string"
+                    ? items.speechmaticsRegion.toLowerCase()
+                    : "us";
+            regionSelect.value = region === "eu" ? "eu" : "us";
+        }
+        if (latencyModeSelect) {
+            const mode =
+                typeof items.latencyMode === "string"
+                    ? items.latencyMode.toLowerCase()
+                    : "fast";
+            latencyModeSelect.value = mode === "accurate" ? "accurate" : "fast";
+        }
         if (allowEditToggle) {
             allowEditToggle.checked = Boolean(items.allowEditWhileTranscribing);
         }
@@ -340,6 +363,12 @@ function loadSettings() {
             const normalized = Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : 500;
             editResumeDelayInput.value = (normalized / 1000).toFixed(1);
             editResumeDelayInput.disabled = !Boolean(items.allowEditWhileTranscribing);
+        }
+        if (editDebounceInput) {
+            const debounceMs = Number(items.editDebounceMs);
+            const normalized = Number.isFinite(debounceMs) && debounceMs >= 100 ? debounceMs : 350;
+            editDebounceInput.value = normalized.toString();
+            editDebounceInput.disabled = !Boolean(items.allowEditWhileTranscribing);
         }
 
         const preferredDeviceId =
@@ -476,10 +505,23 @@ debugToggle.addEventListener("change", () => {
     chrome.storage.sync.set({ debug: debugToggle.checked });
 });
 
+regionSelect?.addEventListener("change", () => {
+    const value = regionSelect.value === "eu" ? "eu" : "us";
+    chrome.storage.sync.set({ speechmaticsRegion: value });
+});
+
+latencyModeSelect?.addEventListener("change", () => {
+    const value = latencyModeSelect.value === "accurate" ? "accurate" : "fast";
+    chrome.storage.sync.set({ latencyMode: value });
+});
+
 allowEditToggle?.addEventListener("change", () => {
     const enabled = Boolean(allowEditToggle.checked);
     if (editResumeDelayInput) {
         editResumeDelayInput.disabled = !enabled;
+    }
+    if (editDebounceInput) {
+        editDebounceInput.disabled = !enabled;
     }
     chrome.storage.sync.set({ allowEditWhileTranscribing: enabled });
 });
@@ -495,6 +537,18 @@ editResumeDelayInput?.addEventListener("change", () => {
     editResumeDelayInput.value = value.toFixed(1);
     const delayMs = Math.round(value * 1000);
     chrome.storage.sync.set({ cursorPinIdleMs: delayMs });
+});
+
+editDebounceInput?.addEventListener("change", () => {
+    let value = parseInt(editDebounceInput.value);
+    if (!Number.isFinite(value) || value < 100) {
+        value = 350;
+    }
+    if (value > 2000) {
+        value = 2000;
+    }
+    editDebounceInput.value = value.toString();
+    chrome.storage.sync.set({ editDebounceMs: value });
 });
 
 refreshMicsBtn?.addEventListener("click", () => {
