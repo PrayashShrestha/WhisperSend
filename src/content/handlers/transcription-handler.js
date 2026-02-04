@@ -43,6 +43,8 @@ const SpeechmasticsTranscriber = (() => {
 
     // State
     let settings = { ...SETTINGS_DEFAULTS };
+    let settingsLoaded = false;
+    let settingsLoadPromise = null;
     let ws = null;
     let isRecording = false;
     // Accumulates *finalized* transcript chunks (AddTranscript).
@@ -74,7 +76,9 @@ const SpeechmasticsTranscriber = (() => {
     // Temporary key caching (browser WS can't set Authorization headers).
     let cachedTempKey = null;
     let cachedTempKeyExpiresAt = 0;
-    const TEMP_KEY_TTL_SECONDS = 600; // 10 minutes
+    // Larger TTL reduces the number of network round-trips needed before recording can start.
+    const TEMP_KEY_TTL_SECONDS = 3600; // 60 minutes
+    let tempKeyPromise = null;
 
     // Logging
     function log(...args) {
@@ -84,8 +88,15 @@ const SpeechmasticsTranscriber = (() => {
     }
 
     // Load settings from chrome storage
-    function loadSettings() {
-        return new Promise((resolve) => {
+    function loadSettings({ force = false } = {}) {
+        if (!force && settingsLoadPromise) {
+            return settingsLoadPromise;
+        }
+        if (!force && settingsLoaded) {
+            return Promise.resolve(settings);
+        }
+
+        settingsLoadPromise = new Promise((resolve) => {
             chrome.storage.sync.get(SYNC_KEYS, (items) => {
                 const base = { ...SETTINGS_DEFAULTS, ...items };
 
@@ -109,11 +120,38 @@ const SpeechmasticsTranscriber = (() => {
                         base.apiKey = apiKey;
 
                         settings = base;
+                        settingsLoaded = true;
                         log("Settings loaded:", settings);
                         resolve(settings);
                     });
                 });
             });
+        }).finally(() => {
+            settingsLoadPromise = null;
+        });
+
+        return settingsLoadPromise;
+    }
+
+    function installSettingsWatcher() {
+        if (window.__testExtTranscriberSettingsWatcherInstalled) return;
+        window.__testExtTranscriberSettingsWatcherInstalled = true;
+
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area !== "sync" && area !== "local") return;
+
+            // Only update known keys; ignore unrelated noise.
+            for (const key of Object.keys(changes || {})) {
+                const next = changes[key]?.newValue;
+                if (key in SETTINGS_DEFAULTS) {
+                    settings[key] = next;
+                }
+                if (key === "speechmaticsApiKey" || key === "apiKey") {
+                    // Token must be refreshed for a new key.
+                    cachedTempKey = null;
+                    cachedTempKeyExpiresAt = 0;
+                }
+            }
         });
     }
 
@@ -175,6 +213,16 @@ const SpeechmasticsTranscriber = (() => {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
                     latencyHint: "interactive",
                 });
+            }
+
+            // Best-effort warm-up: load the AudioWorklet module ahead of time so startRecording
+            // doesn't block on worklet compilation/loading.
+            try {
+                ensureAudioWorkletLoaded().catch(() => {
+                    // ignore
+                });
+            } catch {
+                // ignore
             }
 
             log("Audio initialized");
@@ -282,37 +330,48 @@ const SpeechmasticsTranscriber = (() => {
         if (cachedTempKey && cachedTempKeyExpiresAt - nowMs() > 30_000) {
             return cachedTempKey;
         }
-
-        const resp = await new Promise((resolve) => {
-            chrome.runtime.sendMessage(
-                { eventType: "getSpeechmaticsTempKey", ttlSeconds: TEMP_KEY_TTL_SECONDS },
-                (r) => resolve(r)
-            );
-        });
-
-        if (!resp || resp.ok !== true) {
-            const status = resp?.status;
-            const body = resp?.body;
-            const error = resp?.error || "UNKNOWN";
-
-            if (error === "API_KEY_MISSING") {
-                throw new Error("API key not configured");
-            }
-
-            const details = status ? ` (HTTP ${status})` : "";
-            throw new Error(`Failed to obtain session token${details}`);
+        if (tempKeyPromise) {
+            return tempKeyPromise;
         }
 
-        cachedTempKey = resp.tempKey;
-        cachedTempKeyExpiresAt = nowMs() + (Number(resp.ttlSeconds) || TEMP_KEY_TTL_SECONDS) * 1000;
-        return cachedTempKey;
+        tempKeyPromise = (async () => {
+            const resp = await new Promise((resolve) => {
+                chrome.runtime.sendMessage(
+                    { eventType: "getSpeechmaticsTempKey", ttlSeconds: TEMP_KEY_TTL_SECONDS },
+                    (r) => resolve(r)
+                );
+            });
+
+            if (!resp || resp.ok !== true) {
+                const status = resp?.status;
+                const error = resp?.error || "UNKNOWN";
+
+                if (error === "API_KEY_MISSING") {
+                    throw new Error("API key not configured");
+                }
+
+                const details = status ? ` (HTTP ${status})` : "";
+                throw new Error(`Failed to obtain session token${details}`);
+            }
+
+            cachedTempKey = resp.tempKey;
+            cachedTempKeyExpiresAt =
+                nowMs() + (Number(resp.ttlSeconds) || TEMP_KEY_TTL_SECONDS) * 1000;
+            return cachedTempKey;
+        })();
+
+        try {
+            return await tempKeyPromise;
+        } finally {
+            tempKeyPromise = null;
+        }
     }
 
     // Connect to Speechmatics WebSocket
-    async function connectWebSocket() {
+    async function connectWebSocket({ jwt } = {}) {
         try {
-            const jwt = await getTempKey();
-            const url = `${WEBSOCKET_URL}?jwt=${encodeURIComponent(jwt)}`;
+            const token = typeof jwt === "string" && jwt ? jwt : await getTempKey();
+            const url = `${WEBSOCKET_URL}?jwt=${encodeURIComponent(token)}`;
 
             return new Promise((resolve, reject) => {
                 const myEpoch = ++messageEpoch;
@@ -323,6 +382,7 @@ const SpeechmasticsTranscriber = (() => {
                 ws.onopen = () => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket connected");
+                    notifyConnectionStatus("connected");
                     lastSeqNo = -1;
                     sendStartRecognition();
                     resolve();
@@ -336,6 +396,7 @@ const SpeechmasticsTranscriber = (() => {
                 ws.onerror = (error) => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket error:", error);
+                    notifyConnectionStatus("error");
                     notifyError("Transcription service error. Please try again.", "connection");
                     reject(error);
                 };
@@ -343,6 +404,7 @@ const SpeechmasticsTranscriber = (() => {
                 ws.onclose = () => {
                     if (myEpoch !== activeMessageEpoch) return;
                     log("WebSocket closed");
+                    notifyConnectionStatus("error");
                     ws = null;
                 };
 
@@ -787,15 +849,21 @@ const SpeechmasticsTranscriber = (() => {
         if (isRecording) return;
 
         try {
-            // Reload settings in case they changed
+            // Ensure we have settings loaded (avoid re-loading on every start).
             await loadSettings();
+
+            notifyConnectionStatus("connecting");
+
+            // Fetch the session token in parallel with the microphone prompt for faster starts.
+            const jwtPromise = getTempKey().catch(() => null);
 
             // Initialize audio
             const audioOk = await initializeAudio();
             if (!audioOk) return;
 
             // Connect to WebSocket
-            await connectWebSocket();
+            const jwt = await jwtPromise;
+            await connectWebSocket({ jwt });
 
             isRecording = true;
             sessionId++;
@@ -826,13 +894,14 @@ const SpeechmasticsTranscriber = (() => {
         return stopRecordingWithOptions();
     }
 
-    async function stopRecordingWithOptions({ forceAutoEnter = false } = {}) {
+    async function stopRecordingWithOptions({ forceAutoEnter = false, autoEnter = null } = {}) {
         if (!isRecording) return;
 
         isRecording = false;
         spacebarPushToTalkActive = false;
         // Capture before we clear buffers.
         const shouldForceAutoEnter = Boolean(forceAutoEnter);
+        const hasAutoEnterOverride = typeof autoEnter === "boolean";
 
         stopAudioStreaming();
 
@@ -858,7 +927,10 @@ const SpeechmasticsTranscriber = (() => {
         }
 
         if ((currentTranscript && currentTranscript.trim()) || (currentPartial && currentPartial.trim())) {
-            notifyFinalizeTranscription({ forceAutoEnter: shouldForceAutoEnter });
+            notifyFinalizeTranscription({
+                forceAutoEnter: shouldForceAutoEnter,
+                autoEnter: hasAutoEnterOverride ? Boolean(autoEnter) : null,
+            });
         }
         currentTranscript = "";
         currentPartial = "";
@@ -979,10 +1051,10 @@ const SpeechmasticsTranscriber = (() => {
             // If the user is focused in any editable field (ChatGPT prompt, search, etc),
             // Space must behave normally.
             const active = document.activeElement;
-            if (isEditableElement(active) && !isChatGptPromptContext(active)) {
+            if (isEditableElement(active)) {
                 return false;
             }
-            if (isEditableElement(event.target) && !isChatGptPromptContext(event.target)) {
+            if (isEditableElement(event.target)) {
                 return false;
             }
 
@@ -990,6 +1062,30 @@ const SpeechmasticsTranscriber = (() => {
         }
 
         document.addEventListener("keydown", (event) => {
+            // Toggle recording: Cmd+M (macOS) / Ctrl+M (Windows/Linux).
+            // This stops recording WITHOUT auto-submitting so the user can edit before sending.
+            if (
+                (event.code === "KeyM" || event.key === "m" || event.key === "M") &&
+                !event.repeat &&
+                !event.isComposing &&
+                !event.altKey &&
+                (event.metaKey || event.ctrlKey)
+            ) {
+                try {
+                    event.preventDefault();
+                    event.stopPropagation();
+                } catch {
+                    // ignore
+                }
+
+                if (isRecording) {
+                    stopRecordingWithOptions({ autoEnter: false });
+                } else {
+                    startRecording();
+                }
+                return;
+            }
+
             if (event.code === "Space" && !isRecording && shouldHandleSpacebar(event)) {
                 event.preventDefault(); // avoid page scroll when starting push-to-talk
                 spacebarPushToTalkActive = true;
@@ -1032,10 +1128,14 @@ const SpeechmasticsTranscriber = (() => {
         });
     }
 
-    function notifyFinalizeTranscription({ forceAutoEnter = false } = {}) {
+    function notifyFinalizeTranscription({ forceAutoEnter = false, autoEnter = null } = {}) {
+        const resolvedAutoEnter =
+            typeof autoEnter === "boolean"
+                ? autoEnter
+                : Boolean(forceAutoEnter) || settings.autoEnterAfterSubmit;
         emitToChatGpt({
             type: "finalizeTranscription",
-            autoEnter: Boolean(forceAutoEnter) || settings.autoEnterAfterSubmit,
+            autoEnter: resolvedAutoEnter,
         });
     }
 
@@ -1071,7 +1171,15 @@ const SpeechmasticsTranscriber = (() => {
     // Initialize
     function init() {
         log("Initializing SpeechmasticsTranscriber");
-        loadSettings();
+        installSettingsWatcher();
+        // Warm up settings and temp key in the background so first-start feels snappy.
+        loadSettings().then(() => {
+            if (settings?.apiKey) {
+                getTempKey().catch(() => {
+                    // ignore (user may not have configured a key yet)
+                });
+            }
+        });
         setupKeyboardListener();
 
         // Listen for UI-driven resets (e.g., user pressed Send while still recording).

@@ -32,24 +32,67 @@
     let micStatusIndicator = null;
     let micToggleButton = null; // Mic button above textarea
     let currentPartialText = ""; // Store partial transcription
-    let previewText = ""; // Store preview text for partial transcription
-    let micPositionRaf = null;
-    let isRecordingSession = false;
-    let sessionBaseText = "";
-    let sessionCommittedText = "";
-    let activeTranscriptionSessionId = null;
-    let suppressAutoResetUntilMs = 0;
-    let promptPrefixText = "";
+let previewText = ""; // Store preview text for partial transcription
+let micPositionRaf = null;
+let isRecordingSession = false;
+let sessionBaseText = "";
+let sessionCommittedText = "";
+let activeTranscriptionSessionId = null;
+let suppressAutoResetUntilMs = 0;
+let promptPrefixText = "";
+let suspendRenderUntilMs = 0;
+let lastRenderedSpeechText = "";
+let sendResetInProgress = false;
+let renderRaf = null;
+let renderQueued = false;
+let cachedScrollPromptEl = null;
+let cachedScrollContainer = null;
 
-    function suppressAutoResetFor(ms) {
-        suppressAutoResetUntilMs = Date.now() + Math.max(0, Number(ms) || 0);
+function suppressAutoResetFor(ms) {
+    suppressAutoResetUntilMs = Date.now() + Math.max(0, Number(ms) || 0);
+}
+
+function isAutoResetSuppressed() {
+    return Date.now() < suppressAutoResetUntilMs;
+}
+
+function suspendRenderingFor(ms) {
+    suspendRenderUntilMs = Date.now() + Math.max(0, Number(ms) || 0);
+}
+
+function isRenderingSuspended() {
+    return Date.now() < suspendRenderUntilMs;
+}
+
+function cancelQueuedRender() {
+    if (renderRaf) {
+        try {
+            cancelAnimationFrame(renderRaf);
+        } catch {
+            // ignore
+        }
+        renderRaf = null;
     }
+    renderQueued = false;
+}
 
-    function isAutoResetSuppressed() {
-        return Date.now() < suppressAutoResetUntilMs;
+function queueRender({ immediate = false } = {}) {
+    if (isRenderingSuspended()) return;
+    if (immediate) {
+        cancelQueuedRender();
+        renderSessionTextNow();
+        return;
     }
+    if (renderQueued) return;
+    renderQueued = true;
+    renderRaf = requestAnimationFrame(() => {
+        renderQueued = false;
+        renderRaf = null;
+        renderSessionTextNow();
+    });
+}
 
-    function buildPromptPrefixFromChecklist(list) {
+function buildPromptPrefixFromChecklist(list) {
         const items = Array.isArray(list) ? list : [];
         const lines = items
             .filter((i) => Boolean(i?.checked) && typeof i?.text === "string" && i.text.trim())
@@ -71,14 +114,14 @@
         return { hasPrefix: false, tail: text };
     }
 
-    function ensurePrefix(fullText) {
+function ensurePrefix(fullText) {
         const text = fullText || "";
         if (!promptPrefixText) return text;
         const { tail } = splitPrefix(text);
         return `${promptPrefixText}${tail.replace(/^\n+/, "")}`;
-    }
+}
 
-    function hardResetTranscription({ stopRecording = false } = {}) {
+function hardResetTranscription({ stopRecording = false } = {}) {
         const transcriber =
             (typeof window !== "undefined" &&
                 (window.SpeechmasticsTranscriber || window.SpeechmaticsTranscriber)) ||
@@ -101,23 +144,24 @@
             }
         }
 
-        // Reset UI buffers.
-        sessionBaseText = "";
-        sessionCommittedText = "";
-        currentPartialText = "";
-        previewText = "";
-        lastTranscribedText = "";
-        activeTranscriptionSessionId = null;
+    // Reset UI buffers.
+    sessionBaseText = "";
+    sessionCommittedText = "";
+    currentPartialText = "";
+    previewText = "";
+    lastTranscribedText = "";
+    activeTranscriptionSessionId = null;
+    lastRenderedSpeechText = "";
 
         // If recording continues, keep the session "armed" so incoming partials/finals render.
         isRecordingSession = stillRecording && !stopRecording;
 
-        // Clear the ChatGPT composer content.
-        const promptEl = getPromptElement();
-        if (promptEl) {
-            suppressAutoResetFor(750);
-            setPromptText(promptEl, promptPrefixText || "");
-        }
+    // Clear the ChatGPT composer content.
+    const promptEl = getPromptElement();
+    if (promptEl) {
+        suppressAutoResetFor(750);
+        setPromptText(promptEl, promptPrefixText || "");
+    }
 
         // Tell the transcriber to drop buffers / fast-reconnect (server-side reset).
         try {
@@ -128,11 +172,11 @@
             // ignore
         }
 
-        // Ensure renderer doesn't re-hydrate with stale buffers.
-        if (isRecordingSession) {
-            renderSessionText();
-        }
+    // Ensure renderer doesn't re-hydrate with stale buffers.
+    if (isRecordingSession) {
+        renderSessionText();
     }
+}
 
     function getDomHost() {
         return document.body || document.documentElement || null;
@@ -245,14 +289,76 @@
             return;
         }
 
+        function findScrollContainer(el) {
+            if (!el || !(el instanceof HTMLElement)) return null;
+            if (cachedScrollPromptEl === el && cachedScrollContainer) {
+                return cachedScrollContainer;
+            }
+
+            let cur = el;
+            for (let i = 0; i < 8 && cur; i++) {
+                try {
+                    const style = window.getComputedStyle(cur);
+                    const overflowY = (style.overflowY || "").toLowerCase();
+                    const canScroll =
+                        (overflowY === "auto" || overflowY === "scroll") &&
+                        cur.scrollHeight > cur.clientHeight + 4;
+                    if (canScroll) {
+                        cachedScrollPromptEl = el;
+                        cachedScrollContainer = cur;
+                        return cur;
+                    }
+                } catch {
+                    // ignore
+                }
+                cur = cur.parentElement;
+            }
+            // No obvious scroll container found; don't try to manage scrolling.
+            cachedScrollPromptEl = el;
+            cachedScrollContainer = null;
+            return null;
+        }
+
+        const scrollContainer = findScrollContainer(promptEl);
+        const beforeScrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
+        const wasAtBottom =
+            !!scrollContainer &&
+            scrollContainer.scrollHeight > scrollContainer.clientHeight + 4 &&
+            scrollContainer.scrollTop + scrollContainer.clientHeight >=
+                scrollContainer.scrollHeight - 12;
+
         if (promptEl.tagName === "TEXTAREA" || promptEl.tagName === "INPUT") {
             promptEl.value = text;
             promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+            if (scrollContainer) {
+                if (wasAtBottom) {
+                    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                } else {
+                    // Preserve user scroll position (prevents jumping to top while transcribing).
+                    const maxTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+                    scrollContainer.scrollTop = Math.min(beforeScrollTop, maxTop);
+                }
+            }
             return;
         }
 
         promptEl.innerText = text;
         promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+        if (scrollContainer) {
+            // Let layout settle before enforcing scroll behavior.
+            setTimeout(() => {
+                try {
+                    if (wasAtBottom) {
+                        scrollContainer.scrollTop = scrollContainer.scrollHeight;
+                    } else {
+                        const maxTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+                        scrollContainer.scrollTop = Math.min(beforeScrollTop, maxTop);
+                    }
+                } catch {
+                    // ignore
+                }
+            }, 0);
+        }
     }
 
     function buildNextText(currentText, incomingText) {
@@ -298,17 +404,49 @@
         lastTranscribedText = cleanedMessage;
     }
 
-    function joinTranscriptionText(a, b) {
+function joinTranscriptionText(a, b) {
         const left = (a || "");
         const right = (b || "");
         if (!left) return right;
         if (!right) return left;
         if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
         if (/^[,.;:!?)}\]]/.test(right)) return left + right;
-        return left + " " + right;
+    return left + " " + right;
+}
+
+function overlapSuffixPrefix(a, b) {
+    const left = a || "";
+    const right = b || "";
+    const max = Math.min(left.length, right.length, 1500);
+    for (let len = max; len > 0; len--) {
+        if (left.slice(-len) === right.slice(0, len)) {
+            return len;
+        }
+    }
+    return 0;
+}
+
+function mergeCommittedAndPartial(committedText, partialText) {
+    const committed = committedText || "";
+    const partial = partialText || "";
+    if (!committed) return partial;
+    if (!partial) return committed;
+
+    if (partial.startsWith(committed)) {
+        // Partial already includes committed prefix.
+        return partial;
+    }
+    if (committed.startsWith(partial)) {
+        // Partial is a subset (rare but can happen with revisions).
+        return committed;
     }
 
-    function joinWithSeparator(base, sep, addition) {
+    const overlap = overlapSuffixPrefix(committed, partial);
+    const tail = overlap > 0 ? partial.slice(overlap) : partial;
+    return joinTranscriptionText(committed, tail);
+}
+
+function joinWithSeparator(base, sep, addition) {
         const left = (base || "");
         const right = (addition || "");
         if (!left) return right;
@@ -317,25 +455,44 @@
         return left.endsWith(sep) ? left + right : left + sep + right;
     }
 
-    function renderSessionText() {
-        const promptEl = getPromptElement();
-        if (!promptEl) return;
+function renderSessionTextNow() {
+    if (isRenderingSuspended()) {
+        return;
+    }
+    const promptEl = getPromptElement();
+    if (!promptEl) return;
 
-        const speechText = joinTranscriptionText(sessionCommittedText, currentPartialText);
-        const appendMode = Boolean(settings.appendMode);
-
-        let next;
-        if (!appendMode) {
-            next = ensurePrefix(speechText);
-        } else {
-            const base = ensurePrefix(sessionBaseText);
-            next = joinWithSeparator(base, settings.appendSeparator, speechText);
-        }
-
-        setPromptText(promptEl, next);
+    const candidateSpeechText = mergeCommittedAndPartial(sessionCommittedText, currentPartialText);
+    // Speechmatics can revise partial hypotheses downward when finals land.
+    // Never let the rendered speech shrink; this prevents visible vanishing and "missing last words"
+    // if the user hits Enter immediately.
+    let speechText = candidateSpeechText;
+    if (lastRenderedSpeechText && candidateSpeechText.length < lastRenderedSpeechText.length) {
+        speechText = lastRenderedSpeechText;
+    } else {
+        lastRenderedSpeechText = candidateSpeechText;
     }
 
-    function getComposerFormElement() {
+    const appendMode = Boolean(settings.appendMode);
+
+    let next;
+    if (!appendMode) {
+        next = ensurePrefix(speechText);
+    } else {
+        const base = ensurePrefix(sessionBaseText);
+        next = joinWithSeparator(base, settings.appendSeparator, speechText);
+    }
+
+    const current = getPromptText(promptEl);
+    if (current === next) return;
+    setPromptText(promptEl, next);
+}
+
+function renderSessionText() {
+    queueRender();
+}
+
+function getComposerFormElement() {
         const promptEl = getPromptElement();
         if (promptEl && typeof promptEl.closest === "function") {
             const form = promptEl.closest("form");
@@ -509,114 +666,115 @@
         return false;
     }
 
-    function startSessionIfNeeded() {
-        if (isRecordingSession) return;
-        const promptEl = getPromptElement();
-        const currentText = promptEl ? getPromptText(promptEl) : "";
-        const withPrefix = ensurePrefix(currentText);
+function startSessionIfNeeded() {
+    if (isRecordingSession) return;
+    const promptEl = getPromptElement();
+    const currentText = promptEl ? getPromptText(promptEl) : "";
+    const withPrefix = ensurePrefix(currentText);
         if (promptEl && withPrefix !== currentText) {
             suppressAutoResetFor(750);
             setPromptText(promptEl, withPrefix);
-        }
-        sessionBaseText = withPrefix;
-        sessionCommittedText = "";
-        currentPartialText = "";
-        previewText = "";
-        isRecordingSession = true;
     }
+    sessionBaseText = withPrefix;
+    sessionCommittedText = "";
+    currentPartialText = "";
+    previewText = "";
+    lastRenderedSpeechText = "";
+    isRecordingSession = true;
+}
 
-    function resetSessionState({ clearPrompt = false } = {}) {
-        const promptEl = getPromptElement();
-        if (clearPrompt && promptEl) {
-            setPromptText(promptEl, promptPrefixText || "");
-        }
-        isRecordingSession = false;
-        sessionBaseText = "";
-        sessionCommittedText = "";
-        currentPartialText = "";
-        previewText = "";
+function resetSessionState({ clearPrompt = false } = {}) {
+    const promptEl = getPromptElement();
+    if (clearPrompt && promptEl) {
+        setPromptText(promptEl, promptPrefixText || "");
     }
+    isRecordingSession = false;
+    sessionBaseText = "";
+    sessionCommittedText = "";
+    currentPartialText = "";
+    previewText = "";
+    lastRenderedSpeechText = "";
+}
 
     function isPromptElement(el) {
         const promptEl = getPromptElement();
         return !!promptEl && (el === promptEl || (typeof promptEl.contains === "function" && promptEl.contains(el)));
     }
 
-    function scheduleSessionResetAfterSend() {
-        // When the user sends while *still recording*, Speechmatics will keep streaming
-        // and our UI renderer will keep re-populating the prompt unless we reset both:
-        // - the UI session buffers
-        // - the transcriber buffers (currentTranscript/currentPartial)
-        //
-        // Do it on the next tick so ChatGPT's send handler can read the current composer text.
-        setTimeout(() => {
+function scheduleSessionResetAfterSend() {
+    if (sendResetInProgress) return;
+    sendResetInProgress = true;
+
+    // Freeze our own prompt writes while ChatGPT consumes the current composer text.
+    // We'll resume as soon as we observe the prompt has cleared.
+    suspendRenderingFor(2500);
+
+    (async () => {
+        try {
+            const cleared = await waitForPromptToClear({ timeoutMs: 2500 });
+
             const transcriber =
-                (typeof window !== "undefined" && (window.SpeechmasticsTranscriber || window.SpeechmaticsTranscriber)) ||
+                (typeof window !== "undefined" &&
+                    (window.SpeechmasticsTranscriber || window.SpeechmaticsTranscriber)) ||
                 null;
             const stillRecording =
-                !!transcriber && typeof transcriber.isRecording === "function" ? transcriber.isRecording() : false;
+                !!transcriber && typeof transcriber.isRecording === "function"
+                    ? transcriber.isRecording()
+                    : false;
 
-            // Capture the post-send prompt. In practice, ChatGPT may clear a moment later,
-            // but for voice sessions we want the *next utterance* to start from empty.
-            const promptEl = getPromptElement();
-            const postSendText = promptEl ? getPromptText(promptEl) : "";
+            if (!cleared) {
+                // Submission may have been prevented; keep the current session intact.
+                return;
+            }
 
-            // Reset internal buffers so the next transcription starts fresh.
-            // Do NOT carry over the previous message text even if ChatGPT hasn't cleared yet.
+            // Safe to reset now (ChatGPT already consumed/cleared the composer text).
             sessionBaseText = "";
             sessionCommittedText = "";
             currentPartialText = "";
             previewText = "";
-
-            // Keep session active if recording continues; otherwise fully reset.
-            isRecordingSession = stillRecording;
-
-            // Tell the transcriber to drop its accumulated buffers too.
-            try {
-                window.dispatchEvent(
-                    new CustomEvent("__testExtChatUi", { detail: { type: "resetSession" } })
-                );
-            } catch {
-                // ignore
-            }
-
-            // If recording continues, force-clear the composer so we don't append to the previous message.
-            if (stillRecording && promptEl) {
-                // Prevent our own "prompt cleared" detector from re-triggering.
-                suppressAutoResetFor(750);
-                setPromptText(promptEl, promptPrefixText || "");
-            }
-
-            // Also reset session id gating; we’ll accept the next session id the transcriber emits.
+            lastRenderedSpeechText = "";
             activeTranscriptionSessionId = null;
 
-            renderSessionText();
+            if (stillRecording) {
+                // Reset the server-side session so the next utterance can't "bleed" from the previous one.
+                try {
+                    window.dispatchEvent(
+                        new CustomEvent("__testExtChatUi", { detail: { type: "resetSession" } })
+                    );
+                } catch {
+                    // ignore
+                }
 
-            if (!stillRecording) {
-                // If recording isn't ongoing, fully reset so next start captures a fresh base.
+                // Start a fresh UI session on the now-empty composer (adds prefix if configured).
+                isRecordingSession = false;
+                startSessionIfNeeded();
+            } else {
                 resetSessionState({ clearPrompt: false });
             }
-        }, 0);
-    }
+        } finally {
+            sendResetInProgress = false;
+            suspendRenderUntilMs = 0;
+        }
+    })();
+}
 
     // Handle partial transcription (real-time updates)
-    function handlePartialTranscription(text, isPartial) {
-        if (!isRecordingSession) {
-            // Ignore late/stray partials when not actively recording.
-            return;
-        }
-
-        if (isPartial) {
-            currentPartialText = text;
-            // Show partial text in preview if enabled
-            if (settings.showPartialTranscript) {
-                displayPartialTranscript(text);
-            }
-        } else {
-            currentPartialText = "";
-            clearPartialPreview();
-        }
+function handlePartialTranscription(text, isPartial) {
+    if (!isRecordingSession) {
+        // Ignore late/stray partials when not actively recording.
+        return;
     }
+
+    if (isPartial) {
+        currentPartialText = text;
+        // Show partial text in preview if enabled
+        if (settings.showPartialTranscript) {
+            displayPartialTranscript(text);
+        }
+    } else {
+        // Ignore "clear partial" events to avoid flicker/gaps.
+    }
+}
 
     // Handle transcription insertion
     function handleInsertTranscription(text, autoEnter) {
@@ -916,34 +1074,36 @@
         }
     }
 
-    function handleAppendCommittedTranscript(text) {
-        if (!text || !String(text).trim()) return;
-        startSessionIfNeeded();
-        sessionCommittedText = joinTranscriptionText(sessionCommittedText, text);
-        lastTranscribedText = text;
-        // Once we get committed chunks, we re-render prompt using base + committed (+ current partial).
-        renderSessionText();
+function handleAppendCommittedTranscript(text) {
+    if (!text || !String(text).trim()) return;
+    startSessionIfNeeded();
+
+    // Commit confident chunks immediately so partial shrink/revisions never erase prior words.
+    sessionCommittedText = joinTranscriptionText(sessionCommittedText, text);
+    lastTranscribedText = text;
+    renderSessionText();
+}
+
+function handleFinalizeTranscription({ autoEnter } = {}) {
+    if (!isRecordingSession) {
+        return;
     }
 
-    function handleFinalizeTranscription({ autoEnter } = {}) {
-        if (!isRecordingSession) {
-            return;
-        }
+    // Do not clear partials here. The prompt already contains the latest words (including partials),
+    // and the user may be sending immediately at end-of-speech.
+    renderSessionText();
 
-        // Remove partial overlay, keep committed text in the box.
-        currentPartialText = "";
-        previewText = "";
-        renderSessionText();
+    // Never submit if the prompt has no user text (ignore static prefix).
+    const promptEl = getPromptElement();
+    const raw = promptEl ? getPromptText(promptEl) : "";
+    const tail = splitPrefix(raw).tail.trim();
 
-        // Never submit if we have no committed transcript.
-        const hasCommitted = Boolean((sessionCommittedText || "").trim());
-
-        const shouldAutoSend = Boolean(settings.autoSubmitMessage) || Boolean(autoEnter);
-        if (!shouldAutoSend || !hasCommitted) {
-            // User may want to edit before sending.
-            isRecordingSession = false;
-            return;
-        }
+    const shouldAutoSend = Boolean(settings.autoSubmitMessage) || Boolean(autoEnter);
+    if (!shouldAutoSend || !tail) {
+        // User may want to edit before sending.
+        isRecordingSession = false;
+        return;
+    }
 
         (async () => {
             const didSubmit = await submitChatGptComposerWithRetry({ timeoutMs: 2000 });
@@ -966,13 +1126,14 @@
     }
 
     // Display partial transcription in textarea
-    function displayPartialTranscript(text) {
-        if (!settings.showPartialTranscript) return;
-        if (!isRecordingSession) return;
-        // Render using current session state, which keeps committed text stable while partials change.
-        previewText = text;
-        renderSessionText();
-    }
+function displayPartialTranscript(text) {
+    if (!settings.showPartialTranscript) return;
+    if (!isRecordingSession) return;
+    if (isRenderingSuspended()) return;
+    // Render using current session state, which keeps committed text stable while partials change.
+    previewText = text;
+    renderSessionText();
+}
 
     // Clear partial preview
     function clearPartialPreview() {
