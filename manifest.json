@@ -40,6 +40,8 @@
         "src/content/services/dom-utils.js",
         "src/content/services/settings-manager.js",
         "src/content/handlers/transcription-handler.js",
+        "src/content/chatgpt/dom.js",
+        "src/content/chatgpt/render-utils.js",
         "src/content/handlers/chatgpt.js"
       ],
       "run_at": "document_start"
