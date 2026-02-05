@@ -540,7 +540,9 @@
 
     function queueRender({ immediate = false } = {}) {
         if (isRenderingSuspended()) return;
-        if (isEditActive() || isCursorPinned()) return;
+        if (settings.allowEditWhileTranscribing && (isEditActive() || isCursorPinned())) {
+            return;
+        }
         if (immediate) {
             cancelQueuedRender();
             renderSessionTextNow();
@@ -1311,7 +1313,7 @@
         // CRITICAL: Do not render transcription while user is editing!
         // If we render, transcription will overwrite user's manual edits.
         // Instead, buffer updates until user finishes editing (cursor pin release).
-        if (userCursorPinned) {
+        if (settings.allowEditWhileTranscribing && userCursorPinned) {
             log(`[FREEZE] Skipping render - user is editing, updates are buffered`);
             return;
         }
@@ -1765,7 +1767,7 @@
         if (isPartial) {
             // Phase 1 Fix #4: Smart partial handling with intelligent buffering
             // Instead of blocking updates, merge them into buffers
-            if (isEditActive() || isCursorPinned()) {
+            if (settings.allowEditWhileTranscribing && (isEditActive() || isCursorPinned())) {
                 // Keep the latest partial while editing; don't merge against edited text.
                 editBufferedPartial = String(text || "").trim();
                 saveSessionSnapshot();
@@ -2184,7 +2186,7 @@
 
         // FREEZE RENDERING: Buffer partials while user is editing
         // Never render partials while cursor is pinned - user is making changes!
-        if (userCursorPinned) {
+        if (settings.allowEditWhileTranscribing && userCursorPinned) {
             log(`[FREEZE] Buffering partial while user editing`);
             editBufferedPartial = String(text).trim();  // Buffer latest partial
             return;  // DO NOT render - user is editing!
